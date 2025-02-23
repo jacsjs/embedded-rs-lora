@@ -1,6 +1,26 @@
+[[bin]]
+name = "embedded-rs-lora"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
 [package]
 name = "embedded-rs-lora"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+cortex-m = { version = "0.7.7", features = [
+    "inline-asm",
+    "critical-section-single-core",
+] }
+cortex-m-rtic = "1.1.4"
+embedded-hal = "1.0.0"
+fugit = "0.3.7"
+lora-phy = "3.0.1"
+lorawan-device = "0.12.2"
+nrf52840-hal = "0.18.0"
+panic-halt = "1.0.0"
+rtic-monotonic = "1.0.0"
+rtt-target = "0.6.1"

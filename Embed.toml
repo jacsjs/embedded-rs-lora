@@ -1,0 +1,8 @@
+# For details see:
+# https://github.com/probe-rs/probe-rs/blob/master/probe-rs-tools/src/bin/probe-rs/cmd/cargo_embed/config/default.toml
+
+[default.general]
+chip = "nRF52840_xxAA"
+
+[default.rtt]
+enabled = true
