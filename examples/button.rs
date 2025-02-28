@@ -7,7 +7,7 @@ mod app {
     use cortex_m::asm;
     use embedded_hal::digital::{OutputPin, StatefulOutputPin};
     use nrf52840_hal::{
-        gpio::{p0, Disconnected, Level, Output, Pin, PushPull}, 
+        gpio::{p0, Level, Output, Pin, PushPull}, 
         gpiote::Gpiote,
         pac::TIMER0,
     };

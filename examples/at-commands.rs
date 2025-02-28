@@ -1,16 +1,20 @@
 #![no_main]
 #![no_std]
 
+use panic_halt as _;
 #[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0])]
 mod app {
+    use rtt_target::{rprintln, rtt_init_print};
     use cortex_m::asm;
     use embedded_hal::digital::{OutputPin, StatefulOutputPin};
     use nrf52840_hal::{
-        gpio::{p0, p1, Level, Output, Pin, PushPull}, pac::{ TIMER0, TIMER1, UARTE0}, uarte::{self, Pins}, Timer, Uarte
+        gpio::{p0, Level, Output, Pin, PushPull}, 
+        uarte::{Baudrate, Parity, Pins},
+        pac::TIMER1, 
+        Timer, 
+        Uarte
     };
-    use panic_halt as _;
-    use rtt_target::{rprintln, rtt_init_print};
-    use embedded_rs_lora::{at_command_handler::{self, AtCommandHandler}, mono::{ExtU32, MonoTimer}};
+    use embedded_rs_lora::{at_command_handler::AtCommandHandler, mono::{ExtU32, MonoTimer}};
 
     #[monotonic(binds = TIMER1, default = true)]
     type MyMono = MonoTimer<TIMER1>;
@@ -22,41 +26,35 @@ mod app {
     #[local]
     struct Local {
         blink_led: Pin<Output<PushPull>>,
-        rx_led0: Pin<Output<PushPull>>,
     }
 
     #[init]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         rtt_init_print!();
-        let mut at_buf = [0; 128];
 
         let mut mono = MonoTimer::new(cx.device.TIMER1);
 
         let p0 = p0::Parts::new(cx.device.P0);
-        let p1 = p1::Parts::new(cx.device.P1);
         
         let blink_led = p0.p0_13.into_push_pull_output(Level::High).degrade();
-        let rx_led0 = p0.p0_15.into_push_pull_output(Level::Low).degrade();
 
         // Set RX and TX pins for UARTE0 perhebial. 
         let tx_pin = p0.p0_04.into_push_pull_output(Level::High).degrade();
         let rx_pin = p0.p0_24.into_floating_input().degrade();
 
-        let uarte0 = Uarte::new(cx.device.UARTE0, 
+        let uarte0 = Uarte::new(
+            cx.device.UARTE0, 
             Pins{rxd: rx_pin, txd: tx_pin, cts: None, rts: None}, 
-            nrf52840_hal::uarte::Parity::EXCLUDED, 
-            nrf52840_hal::uarte::Baudrate::BAUD9600);
+            Parity::EXCLUDED, 
+            Baudrate::BAUD9600);
 
         let mut res_buf = [0; 128];
         let timer0 = Timer::new(cx.device.TIMER0);
         
         let mut at = AtCommandHandler::new(uarte0, timer0, 1_000_000);
-        let (x,) = at.send_expect_response(
-            &mut res_buf,
-            |b| b
-                .named("+TESTQUERY")
-                .finish(), 
-            |p| p
+        let (x,) = at.send_expect_response(&mut res_buf,
+            |builder| builder.named("+TESTQUERY").finish(), 
+            |parser| parser
                 .expect_identifier(b"AT+RESPONSE=")
                 .expect_int_parameter()
                 .expect_identifier(b"\r\n")
@@ -67,14 +65,14 @@ mod app {
 
         // Initiate periodic process
         blink::spawn_after(1.secs(), mono.now()).unwrap();
-        (Shared {  }, Local { blink_led, rx_led0, }, init::Monotonics(mono))
+        (Shared {  }, Local { blink_led }, init::Monotonics(mono))
     }
 
     #[idle]
-    fn idle(c_x: idle::Context) -> ! {
+    fn idle(_cx: idle::Context) -> ! {
         loop {
             rprintln!("sleeping...");
-            asm::delay(10_000_000);
+            asm::wfi();
         }
     }
 

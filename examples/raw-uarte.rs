@@ -1,8 +1,10 @@
 #![no_main]
 #![no_std]
 
+use panic_halt as _;
 #[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0])]
 mod app {
+    use rtt_target::{rprintln, rtt_init_print};
     use cortex_m::asm;
     use embedded_hal::digital::{OutputPin, StatefulOutputPin};
     use nrf52840_hal::{
@@ -10,8 +12,6 @@ mod app {
         gpiote::Gpiote, 
         pac::{UARTE1, TIMER0},
     };
-    use panic_halt as _;
-    use rtt_target::{rprintln, rtt_init_print};
     use embedded_rs_lora::mono::{ExtU32, MonoTimer};
 
     #[monotonic(binds = TIMER0, default = true)]
@@ -29,7 +29,7 @@ mod app {
         button_led: Pin<Output<PushPull>>,
         rx_led1: Pin<Output<PushPull>>,
         rx_buf1: [u8; 1],
-        tx_buf1: [u8; 14],
+        tx_buf1: [u8; 17],
     }
 
     #[init]
@@ -62,13 +62,8 @@ mod app {
         gpiote.channel0().input_pin(&button1).hi_to_lo().enable_interrupt();
         gpiote.channel1().input_pin(&button2).hi_to_lo().enable_interrupt();
 
-        // Configure the u.
-        uarte1.config.write(|w| {
-            w.parity().excluded(); // No parity
-            w.hwfc().disabled();   // Disable hardware flow control
-            // Other configurations can be set here
-            w
-        });
+        // Configure the uarte1 peripheral
+        uarte1.config.write(|w| { w.parity().excluded().hwfc().disabled() });
 
         // Set baud rate
         uarte1.baudrate.write(|w| w.baudrate().baud9600());
@@ -87,9 +82,7 @@ mod app {
         uarte1.tasks_startrx.write(|w| unsafe { w.bits(1) });
 
         let rx_buf1 = [0; 1];
-
-        // "Hello Arduino\n"
-        let tx_buf1 = [72, 101, 108, 108, 111, 32, 65, 114, 100, 117, 105, 110, 111, b'\n'];
+        let tx_buf1 = "Hello Arduino!:D\n".as_bytes().try_into().unwrap();
 
         // Initiate periodic processes
         blink::spawn_after(1.secs(), mono.now()).unwrap();
@@ -130,10 +123,7 @@ mod app {
             } else if gpiote.channel1().is_event_triggered() {
                 uart1_tx::spawn().unwrap();
             } 
-            // Reset all events
             gpiote.reset_events();
-            // Debounce
-            //debounce::spawn_after(50.millis()).ok();
         });
     }
 

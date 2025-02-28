@@ -1,8 +1,10 @@
 #![no_main]
 #![no_std]
 
+use panic_halt as _;
 #[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0])]
 mod app {
+    use rtt_target::{rprintln, rtt_init_print};
     use cortex_m::asm;
     use nrf52840_hal::{
         gpio::{p0, Disconnected}, 
@@ -11,8 +13,6 @@ mod app {
         Saadc,
     };
     use embedded_rs_lora::mono::{ExtU32, MonoTimer};
-    use panic_halt as _;
-    use rtt_target::{rprintln, rtt_init_print};
 
     // Holds all analog pins in use.
     struct SaadcPins {
