@@ -1,5 +1,5 @@
 use at_commands::{builder::{CommandBuilder, Initialized, Query}, parser::{CommandParser, ParseError}};
-use nrf52840_hal::{timer, uarte, Timer, Uarte};
+use nrf52840_hal::{timer, uarte::{self, Error}, Timer, Uarte};
 
 /// Handler for managing AT commands on the nrf52840 device.
 /// Must attach a [Uarte] peripheral for serial communication consisting of AT requests and responses.
@@ -51,29 +51,61 @@ where
 
     /// Compact way of both AT command creation and (query, response) pair transactions.
     pub fn send_expect_response<'a, F, G, D>
-    (&'a mut self, rx_buffer: &'a mut [u8], at_builder: G, parser: F) -> Result<D, ParseError>
+    (&'a mut self, rx_buffer: &'a mut [u8], at_builder: G, parser: F) -> Result<D, Error>
     where
         F: FnOnce(CommandParser<'a, ()>) -> Result<D, ParseError>,
         G: FnOnce(CommandBuilder<'a, Initialized<Query>>) -> Result<&'a [u8], usize>,
     {
-        let at_com = at_builder(CommandBuilder::create_query(&mut self.buf, true)).unwrap();
+        let at_com = match at_builder(CommandBuilder::create_query(&mut self.buf, true)) {
+            Ok(data) => data,
+            Err(_) => return Err(Error::Transmit),
+        };
+        match self.uarte.write(&at_com) {
+            Ok(_) => {
+                match self.uarte.read_timeout(rx_buffer, &mut self.timer, self.cycle_wait) {
+                    _ => {
+                        match parser(CommandParser::parse(rx_buffer)) {
+                            Ok(data) => Ok(data),
+                            Err(_) => Err(Error::Receive),
+                        }
+                    },
+                }
+            },
+            Err(e) => {
+                Err(e)
+            },
+        }  
+    }
 
-        self.uarte.write(&at_com).unwrap();
-        self.uarte.read_timeout(rx_buffer, &mut self.timer, self.cycle_wait).err();
-
-        parser(CommandParser::parse(rx_buffer))
-        
+    pub fn send_expect_string<'a, G>
+    (&'a mut self, rx_buffer: &'a mut [u8], at_builder: G) -> Result<(), Error>
+    where
+        G: FnOnce(CommandBuilder<'a, Initialized<Query>>) -> Result<&'a [u8], usize>,
+    {
+        let at_com = match at_builder(CommandBuilder::create_query(&mut self.buf, true)) {
+            Ok(data) => data,
+            Err(_) => return Err(Error::Transmit),
+        };
+        match self.uarte.write(&at_com) {
+            Ok(_) => {
+                self.uarte.read_timeout(rx_buffer, &mut self.timer, self.cycle_wait)
+            },
+            Err(e) => {
+                Err(e)
+            },
+        }
     }
 
     /// In case no particular response message is expected or wished upon.
     pub fn send_no_response<'a, G>
-    (&'a mut self, at_builder: G)
+    (&'a mut self, at_builder: G) -> Result<(), Error>
     where
         G: FnOnce(CommandBuilder<'a, Initialized<Query>>) -> Result<&'a [u8], usize>,
     {
-        let at_com = at_builder(CommandBuilder::create_query(&mut self.buf, true)).unwrap();
-
-        self.uarte.write(&at_com).unwrap();
+        let at_com = match at_builder(CommandBuilder::create_query(&mut self.buf, true)) {
+            Ok(data) => data,
+            Err(_) => return Err(Error::Transmit),
+        };
+        self.uarte.write(&at_com)
     }
-
 }
