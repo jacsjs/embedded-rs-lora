@@ -97,6 +97,44 @@ mod app {
                 };
             assert_eq!(string, "AT+TESTSTRING=5555");
 
+            let (x,y, s) = match cx.local.at.set_expect_response(
+                &mut com_buf,
+                &mut res_buf,
+                |builder| builder
+                    .named("+SET")
+                    .with_int_parameter(100)
+                    .with_int_parameter(70)
+                    .with_string_parameter("hello")
+                    .finish(), 
+                |parser| parser
+                    .expect_identifier(b"AT+SET=")
+                    .expect_int_parameter()
+                    .expect_int_parameter()
+                    .expect_string_parameter()
+                    .expect_identifier(b"\r\n")
+                    .finish()) 
+                    {
+                        Ok(tu) => tu,
+                        Err(at_err) => {
+                            rprintln!("Error: {:?}", at_err);
+                            (0,0, "")
+                        } 
+                    };
+            // If no crash, then it's working as expected
+            assert_eq!((x, y, s), (100, 70, "hello"));
+
+            let string = match cx.local.at.query_expect_string(&mut com_buf, &mut res_buf, 
+                |builder| builder.named("+TESTSTRING2").with_int_parameter(111111).finish())
+                {
+                    Ok(tu) => tu,
+                    Err(at_err) => {
+                        rprintln!("Error: {:?}", at_err);
+                        ""
+                    } 
+                };
+            assert_eq!(string, "AT+TESTSTRING2=111111");
+
+
             rprintln!("Everything is ok! Sleeping...");
         }
     }
