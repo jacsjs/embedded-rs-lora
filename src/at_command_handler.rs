@@ -69,19 +69,16 @@ where
     }
 
     /// Common internal function to handle sending AT commands and reading responses
-    fn execute_command<'a, F, G, D>(
+    fn execute_command<'a, F, D>(
         &'a mut self,
         rx_buffer: &'a mut [u8],
+        at_com: &'a [u8],
         custom_cycle_wait: Option<usize>,
-        at_builder: G,
         parser: F,
     ) -> Result<D, AtCommandError>
     where
         F: FnOnce(CommandParser<'a, ()>) -> Result<D, ParseError>,
-        G: FnOnce(CommandBuilder<'a, Initialized<Set>>) -> Result<&'a [u8], usize>,
     {
-        let at_com = at_builder(CommandBuilder::create_set(&mut self.buf, true))
-            .map_err(|size_req| AtCommandError::Other(size_req.into()))?;
 
         //self.uarte.write(&at_com).map_err(AtCommandError::from)?;
         self.uarte.write(&at_com).unwrap();
@@ -104,9 +101,10 @@ where
     }
 
     #[inline(always)]
-    pub fn send_expect_response<'a, F, G, D>(
+    pub fn set_expect_response<'a, F, G, D>(
         &'a mut self,
-        rx_buffer: &'a mut [u8],
+        buf: &'a mut [u8],
+        read_buf: &'a mut [u8],
         at_builder: G,
         parser: F,
     ) -> Result<D, AtCommandError>
@@ -114,22 +112,65 @@ where
         F: FnOnce(CommandParser<'a, ()>) -> Result<D, ParseError>,
         G: FnOnce(CommandBuilder<'a, Initialized<Set>>) -> Result<&'a [u8], usize>,
     {
-        self.execute_command(rx_buffer, None, at_builder, parser)
+        let at_com = at_builder(CommandBuilder::create_set(buf, true))
+            .map_err(|size_req| AtCommandError::Other(size_req.into()))?;
+        self.execute_command(read_buf, at_com, None, parser)
+    }
+
+    #[inline(always)]
+    pub fn query_expect_response<'a, F, G, D>(
+        &'a mut self,
+        buf: &'a mut [u8],
+        read_buf: &'a mut [u8],
+        at_builder: G,
+        parser: F,
+    ) -> Result<D, AtCommandError>
+    where
+        F: FnOnce(CommandParser<'a, ()>) -> Result<D, ParseError>,
+        G: FnOnce(CommandBuilder<'a, Initialized<Query>>) -> Result<&'a [u8], usize>,
+    {
+        let at_com = at_builder(CommandBuilder::create_query(buf, true))
+            .map_err(|size_req| AtCommandError::Other(size_req.into()))?;
+        self.execute_command(read_buf, at_com, None, parser)
     }
 
     /// In case the returned string is of interest, instead of parsing a specific response.
     /// 
     /// Useful for debugging and testing.
     #[inline(always)]
-    pub fn send_expect_string<'a, G>(
+    pub fn set_expect_string<'a, G>(
         &'a mut self,
-        rx_buffer: &'a mut [u8],
+        buf: &'a mut [u8],
+        read_buf: &'a mut [u8],
         at_builder: G,
     ) -> Result<&'a str, AtCommandError>
     where
         G: FnOnce(CommandBuilder<'a, Initialized<Set>>) -> Result<&'a [u8], usize>,
     {
-        self.execute_command(rx_buffer, None, at_builder, |parser| {
+        let at_com = at_builder(CommandBuilder::create_set(buf, true))
+            .map_err(|size_req| AtCommandError::Other(size_req.into()))?;
+        self.execute_command(read_buf, at_com, None, |parser| {
+            parser.expect_raw_string().finish()
+        })
+        .map(|tu| tu.0 )
+    }
+
+    /// In case the returned string is of interest, instead of parsing a specific response.
+    /// 
+    /// Useful for debugging and testing.
+    #[inline(always)]
+    pub fn query_expect_string<'a, G>(
+        &'a mut self,
+        buf: &'a mut [u8],
+        read_buf: &'a mut [u8],
+        at_builder: G,
+    ) -> Result<&'a str, AtCommandError>
+    where
+        G: FnOnce(CommandBuilder<'a, Initialized<Set>>) -> Result<&'a [u8], usize>,
+    {
+        let at_com = at_builder(CommandBuilder::create_set(buf, true))
+            .map_err(|size_req| AtCommandError::Other(size_req.into()))?;
+        self.execute_command(read_buf, at_com, None, |parser| {
             parser.expect_raw_string().finish()
         })
         .map(|tu| tu.0 )
@@ -137,7 +178,7 @@ where
 
     /// In case no particular response message is expected or wished upon.
     #[inline(always)]
-    pub fn send_no_response<'a, G>(
+    pub fn set_no_response<'a, G>(
         &'a mut self,
         at_builder: G,
     ) -> Result<(), AtCommandError>
@@ -145,6 +186,22 @@ where
         G: FnOnce(CommandBuilder<'a, Initialized<Set>>) -> Result<&'a [u8], usize>,
     {
         let at_com = at_builder(CommandBuilder::create_set(&mut self.buf, true))
+            .map_err(|size_req| AtCommandError::Other(size_req.into()))?;
+
+        // Send the command but do not attempt to read a response.
+        self.uarte.write(&at_com).map_err(AtCommandError::from)
+    }
+
+    /// In case no particular response message is expected or wished upon.
+    #[inline(always)]
+    pub fn query_no_response<'a, G>(
+        &'a mut self,
+        at_builder: G,
+    ) -> Result<(), AtCommandError>
+    where
+        G: FnOnce(CommandBuilder<'a, Initialized<Query>>) -> Result<&'a [u8], usize>,
+    {
+        let at_com = at_builder(CommandBuilder::create_query(&mut self.buf, true))
             .map_err(|size_req| AtCommandError::Other(size_req.into()))?;
 
         // Send the command but do not attempt to read a response.
