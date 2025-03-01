@@ -8,11 +8,7 @@ mod app {
     use cortex_m::asm;
     use embedded_hal::digital::{OutputPin, StatefulOutputPin};
     use nrf52840_hal::{
-        gpio::{p0, Level, Output, Pin, PushPull}, 
-        uarte::{Baudrate, Parity, Pins},
-        pac::TIMER1, 
-        Timer, 
-        Uarte
+        gpio::{p0, Level, Output, Pin, PushPull}, pac::{TIMER0, TIMER1, UARTE0}, uarte::{Baudrate, Parity, Pins}, Timer, Uarte
     };
     use embedded_rs_lora::{at_command_handler::AtCommandHandler, mono::{ExtU32, MonoTimer}};
 
@@ -26,6 +22,7 @@ mod app {
     #[local]
     struct Local {
         blink_led: Pin<Output<PushPull>>,
+        at: AtCommandHandler<UARTE0, TIMER0>,
     }
 
     #[init]
@@ -40,7 +37,7 @@ mod app {
 
         // Set RX and TX pins for UARTE0 perhebial. 
         let tx_pin = p0.p0_04.into_push_pull_output(Level::High).degrade();
-        let rx_pin = p0.p0_24.into_floating_input().degrade();
+        let rx_pin = p0.p0_31.into_floating_input().degrade();
 
         let uarte0 = Uarte::new(
             cx.device.UARTE0, 
@@ -48,31 +45,36 @@ mod app {
             Parity::EXCLUDED, 
             Baudrate::BAUD9600);
 
-        let mut res_buf = [0; 128];
         let timer0 = Timer::new(cx.device.TIMER0);
         
-        let mut at = AtCommandHandler::new(uarte0, timer0, 1_000_000);
-        let (x,) = at.send_expect_response(&mut res_buf,
-            |builder| builder.named("+TESTQUERY").finish(), 
-            |parser| parser
-                .expect_identifier(b"AT+RESPONSE=")
-                .expect_int_parameter()
-                .expect_identifier(b"\r\n")
-                .finish()
-            ).unwrap_or((0,));
-        
-        rprintln!("VALUE: {}", x);
+        let at = AtCommandHandler::new(uarte0, timer0, 1_000_000);
 
         // Initiate periodic process
         blink::spawn_after(1.secs(), mono.now()).unwrap();
-        (Shared {  }, Local { blink_led }, init::Monotonics(mono))
+        (Shared {  }, Local { blink_led, at }, init::Monotonics(mono))
     }
 
-    #[idle]
-    fn idle(_cx: idle::Context) -> ! {
+    #[idle(local = [at])]
+    fn idle(cx: idle::Context) -> ! {
+        let mut res_buf = [0; 128];
         loop {
+            let (x,y) = match cx.local.at.send_expect_response(&mut res_buf,
+                |builder| builder.named("+SET").with_int_parameter(42).with_int_parameter(31).finish(), 
+                |parser| parser
+                    .expect_identifier(b"AT+SET=")
+                    .expect_int_parameter()
+                    .expect_int_parameter()
+                    .expect_identifier(b"\r\n")
+                    .finish()) {
+                        Ok(tu) => tu,
+                        Err(at_err) => {
+                            rprintln!("Error: {:?}", at_err);
+                            (0,0)
+                        } 
+                    };
+            // If no crash, then it's working as expected
+            assert_eq!((x, y), (42, 31));
             rprintln!("sleeping...");
-            asm::wfi();
         }
     }
 
