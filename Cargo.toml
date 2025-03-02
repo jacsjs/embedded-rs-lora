@@ -1,5 +1,6 @@
 [[bin]]
 name = "embedded-rs-lora"
+authors = ["Jacob Sjöström <jacsjs-dev@pm.me>"]
 path = "src/main.rs"
 test = false
 doctest = false
@@ -25,3 +26,13 @@ nrf52840-hal = "0.18.0"
 panic-halt = "1.0.0"
 rtic-monotonic = "1.0.0"
 rtt-target = "0.6.1"
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = true
+debug-assertions = true

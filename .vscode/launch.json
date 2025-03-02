@@ -1,0 +1,76 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "preLaunchTask": "cargo build --example",
+      "type": "probe-rs-debug",
+      "request": "launch",
+      "name": "nRF52840 example",
+      "chip": "nRF52840_xxAA",
+      "flashingConfig": {
+        "flashingEnabled": true,
+        "haltAfterReset": false,
+        "formatOptions": {
+          "binaryFormat": "elf"
+        }
+      },
+      "coreConfigs": [
+        {
+          "programBinary": "target/thumbv7em-none-eabi/debug/examples/${fileBasenameNoExtension}",
+          "coreIndex": 0,
+          "rttEnabled": true,
+          "rttChannelFormats": [
+            {
+              "channelNumber": 0,
+              // Format RTT data as String data
+              "dataFormat": "String",
+              // Include host-side timestamps for every line of data transferred from the target RTT output
+              "showTimestamps": true
+            },
+            {
+              "channelNumber": 1,
+              // Treat data as raw binary data, and do not format in any way
+              "dataFormat": "BinaryLE"
+            }
+          ]
+        },
+      ]
+    },
+    {
+      "preLaunchTask": "cargo build --release",
+      "type": "probe-rs-debug",
+      "request": "launch",
+      "name": "nRF52840 release",
+      "chip": "nRF52840_xxAA",
+      "flashingConfig": {
+        "flashingEnabled": true,
+        "haltAfterReset": false,
+        "formatOptions": {
+          "binaryFormat": "elf"
+        }
+      },
+      "coreConfigs": [
+        {
+          "programBinary": "target/thumbv7em-none-eabi/release/${workspaceFolderBasename}",
+          "coreIndex": 0,
+          "rttEnabled": true,
+          "rttChannelFormats": [
+            {
+              "channelNumber": 0,
+              // Format RTT data as String data
+              "dataFormat": "String",
+              // Include host-side timestamps for every line of data transferred from the target RTT output
+              "showTimestamps": true
+            },
+            {
+              "channelNumber": 1,
+              // Treat data as raw binary data, and do not format in any way
+              "dataFormat": "BinaryLE"
+            }
+          ]
+        },
+      ]
+    },
+    
+  ]
+}
