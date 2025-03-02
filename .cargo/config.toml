@@ -1,6 +1,7 @@
 [target.thumbv7m-none-eabi]
 # uncomment this to make `cargo run` execute programs on QEMU
 # runner = "qemu-system-arm -cpu cortex-m3 -machine lm3s6965evb -nographic -semihosting-config enable=on,target=native -kernel"
+runner = "probe-rs run --chip nRF52840_xxAA"
 
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 # uncomment ONE of these three option to make `cargo run` start a GDB session
@@ -13,15 +14,18 @@ runner = "probe-rs run --chip nRF52840_xxAA"
 rustflags = [
   # This is needed if your flash or ram addresses are not aligned to 0x10000 in memory.x
   # See https://github.com/rust-embedded/cortex-m-quickstart/pull/95
+  # "-C", "linker=flip-link",
   "-C",
   "link-arg=--nmagic",
+  #"-C", "link-arg=-Tdefmt.x", # Complains about missing symbols: https://github.com/knurling-rs/defmt/issues/751 
+  # https://github.com/probe-rs/probe-rs/issues/1386
 
   # LLD (shipped with the Rust toolchain) is used as the default linker
   "-C",
   "link-arg=-Tlink.x",
 
   # Cross language LTO optimization
-  # "-C", "linker-plugin-lto",
+  "-C", "linker-plugin-lto",
 
   # if you run into problems with LLD switch to the GNU linker by commenting out
   # this line
