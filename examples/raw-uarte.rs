@@ -2,25 +2,35 @@
 #![no_std]
 
 use panic_halt as _;
-#[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0])]
+#[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0, SWI1_EGU1])]
 mod app {
+    use defmt::println;
+    use fugit::Instant;
     use rtt_target::{rprintln, rtt_init_print};
     use cortex_m::asm;
     use embedded_hal::digital::{OutputPin, StatefulOutputPin};
     use nrf52840_hal::{
         gpio::{p0, p1, Level, Output, Pin, PushPull}, 
         gpiote::Gpiote, 
-        pac::{UARTE1, TIMER0},
+        pac::{twim0::events_rxstarted, Interrupt, TIMER0, TIMER1, UARTE1}, Timer,
     };
-    use embedded_rs_lora::mono::{ExtU32, MonoTimer};
+    use embedded_rs_lora::{mono::{ExtU32, Instance32, MonoTimer}};
 
-    #[monotonic(binds = TIMER0, default = true)]
-    type MyMono = MonoTimer<TIMER0>;
+    #[monotonic(binds = TIMER1, default = true)]
+    type MyMono = MonoTimer<TIMER1>;
+
+    // How long uarte timeout is.
+    const RX_TIMEOUT_TICKS: u32 = 1_000_000;
 
     #[shared]
     struct Shared {
         gpiote: Gpiote, 
+        #[lock_free]
         uarte1: UARTE1,
+        #[lock_free]
+        rx_buf1: [u8; 4],
+        #[lock_free]
+        timeout_timer: Timer<TIMER0>,
     }
 
     #[local]
@@ -28,7 +38,6 @@ mod app {
         blink_led: Pin<Output<PushPull>>,
         button_led: Pin<Output<PushPull>>,
         rx_led1: Pin<Output<PushPull>>,
-        rx_buf1: [u8; 1],
         tx_buf1: [u8; 17],
     }
 
@@ -37,7 +46,9 @@ mod app {
         rtt_init_print!();
 
         // Timers
-        let mut mono = MonoTimer::new(cx.device.TIMER0);
+        let mut mono = MonoTimer::new(cx.device.TIMER1);
+
+        let timeout_timer = Timer::one_shot(cx.device.TIMER0);
         
         // Ownership of Peripherals.
         let p0 = p0::Parts::new(cx.device.P0);
@@ -72,22 +83,32 @@ mod app {
         uarte1.psel.rxd.write(|w| unsafe { w.bits(sen_rx.psel_bits()) });
         uarte1.psel.txd.write(|w| unsafe { w.bits(sen_tx.psel_bits()) });
 
-        // Enable u
-        uarte1.enable.write(|w| w.enable().enabled());
-
-        // Enable ENDRX interrupt. ENDRX event is invoked when bytes flushed to buffer is full.
-        uarte1.intenset.write(|w| w.endrx().set_bit());
-
-        // Setup complete; ready to start reception.
-        uarte1.tasks_startrx.write(|w| unsafe { w.bits(1) });
-
-        let rx_buf1 = [0; 1];
+        let rx_buf1 = [0; 4];
         let tx_buf1 = "Hello Arduino!:D\n".as_bytes().try_into().unwrap();
+
+        // Enable uarte peripheral.
+        uarte1.enable.write(|w| w.enable().enabled());
+        // START_RX() shortcut from an ENDRX event signifying that the buffer is full.
+        uarte1.shorts.write(|w| { w.endrx_startrx().enabled() });
+
+        // When the start rx shortcut is triggered (after the buffer has been filled)
+        // we want to prepare for the next buffer by flipping etc. (double buffered)
+        uarte1.intenset.write(|w| w.rxstarted().set_bit());
+
+        // Set Easy DMA buffer addresses and size for transfer from rxd register.
+        uarte1.rxd.maxcnt.write(|w| unsafe { w.bits(rx_buf1.len() as u32) });
+        uarte1.rxd.ptr.write(|w| unsafe { w.ptr().bits(rx_buf1.as_ptr() as u32) });
+
+        // Start the Uarte receiver.
+        uarte1.tasks_startrx.write(|w| w.tasks_startrx().set_bit() );
+
+        rtic::pend(Interrupt::UARTE1);
+
 
         // Initiate periodic processes
         blink::spawn_after(1.secs(), mono.now()).unwrap();
 
-        (Shared { gpiote, uarte1 }, Local { blink_led, button_led, rx_led1, rx_buf1, tx_buf1}, init::Monotonics(mono))
+        (Shared { gpiote, uarte1, rx_buf1, timeout_timer }, Local { blink_led, button_led, rx_led1, tx_buf1, }, init::Monotonics(mono))
     }
 
     #[idle]
@@ -97,6 +118,87 @@ mod app {
             asm::wfi();
         }
     }
+
+    #[task(binds = UARTE1, priority=5, shared=[uarte1, rx_buf1], local = [rx_led1])]
+    fn rx_interrupt(mut cx: rx_interrupt::Context){
+
+        rprintln!("RX_INTERRUPT");
+        // BEGIN STATE ENDRX
+        if cx.shared.uarte1.events_endrx.read().events_endrx().bit() {
+            rprintln!("STATE_ENDRX");
+
+            cx.shared.uarte1.events_endrx.reset();
+
+
+            // HERE WE WANT TO PROCESS THE BUFFER BEFORE A NEW ONE IS STARTING TO FILL
+            // IF WE DONT TAKE CARE OF BYTES IN THE BUFFER UNTIL THIS ISR ENDS
+            // STARTRX WILL START FILLING THE BUFFER AGAIN, AND WE LOSE DATA.
+            let bytes_since_last = cx.shared.uarte1.rxd.amount.read().bits(); 
+
+            let test = cx.shared.uarte1.rxd.ptr.as_ptr();
+
+            rprintln!("Since last time: {}", bytes_since_last);
+        } 
+        // BEGIN STATE TIMEOUT
+        else if cx.shared.uarte1.events_rxto.read().events_rxto().bit(){
+
+            rprintln!("STATE_TIMEOUT");
+
+            // OFF(rxto)
+            cx.shared.uarte1.intenclr.write(|w| w.rxto().clear() );
+            cx.shared.uarte1.events_rxto.reset();
+
+            cx.shared.uarte1.events_endrx.reset();
+
+            // HERE WE WANT TO PROCESS THE BUFFER BEFORE A NEW ONE IS STARTING TO FILL
+            // IF WE DONT TAKE CARE OF BYTES IN THE BUFFER UNTIL THIS ISR ENDS
+            // STARTRX WILL START FILLING THE BUFFER AGAIN, AND WE LOSE DATA.
+
+            let bytes_since_last = cx.shared.uarte1.rxd.amount.read().bits(); 
+
+            let test = cx.shared.uarte1.rxd.ptr.as_ptr();
+
+            rprintln!("Since last time: {}", bytes_since_last);
+
+            // FLUSH RXD into BUFFER. 
+            // Up to 4 bytes are received after END_RX before TIMEOUT is triggered.
+            cx.shared.uarte1.tasks_flushrx.write(|w| w.tasks_flushrx().set_bit() );
+        }
+        // BEGIN STATE RXSTARTED
+        else if cx.shared.uarte1.events_rxstarted.read().events_rxstarted().bit() {
+            rprintln!("STATE_RXSTARTED");
+
+            // OFF(endrx)
+            cx.shared.uarte1.intenclr.write(|w| w.endrx().clear() );
+            cx.shared.uarte1.events_endrx.reset();
+            cx.shared.uarte1.events_rxstarted.reset();
+
+            // HERE INSERT BUFFER FLIPPING OR BUFFER UPDATING
+            // The datasheet implementation just increments 
+            // the buffer by maxcnt * datasize.
+
+            // Set Easy DMA buffer addresses and size for transfer from rxd register.
+            cx.shared.uarte1.rxd.maxcnt.write(|w| unsafe { w.bits(cx.shared.rx_buf1.len() as u32) });
+            cx.shared.uarte1.rxd.ptr.write(|w| unsafe { w.ptr().bits(cx.shared.rx_buf1.as_ptr() as u32) });
+
+            // ON(rxdrdy)
+            cx.shared.uarte1.intenset.write(|w| w.rxdrdy().set() );
+        }
+        // BEGIN STATE RDXRDY
+        else if cx.shared.uarte1.events_rxdrdy.read().events_rxdrdy().bit(){
+            rprintln!("STATE_RXDRDY");
+
+            // OFF(rxdrdy)
+            cx.shared.uarte1.intenclr.write(|w|w.rxdrdy().clear() );
+            cx.shared.uarte1.events_rxdrdy.reset();
+
+            // ON(rxto)
+            cx.shared.uarte1.intenset.write(|w| w.rxto().set() );
+
+            // ON(endrx)
+            cx.shared.uarte1.intenset.write(|w| w.endrx().set() );
+        }
+    }        
 
     #[task(local = [blink_led])]
     fn blink(cx: blink::Context, instant: fugit::TimerInstantU32<1_000_000>) {
@@ -121,68 +223,8 @@ mod app {
                     b_led.set_low().ok();
                 }
             } else if gpiote.channel1().is_event_triggered() {
-                uart1_tx::spawn().unwrap();
             } 
             gpiote.reset_events();
         });
-    }
-
-    #[task(binds = UARTE1, shared=[uarte1], local = [rx_buf1, rx_led1])]
-    fn uart0_rx(mut cx: uart0_rx::Context){
-        cx.shared.uarte1.lock(|u| {
-            // Stop reception.
-            u.tasks_stoprx.write(|w| unsafe { w.bits(1) });
-
-            // Wait for the reception to have stopped.
-            while u.events_rxto.read().bits() == 0 {}
-
-            // Set Easy DMA buffer addresses and size for transfer from rxd register.
-            u.rxd.maxcnt.write(|w| unsafe { w.bits(cx.local.rx_buf1.len() as u32) });
-            u.rxd.ptr.write(|w| unsafe { w.ptr().bits(cx.local.rx_buf1.as_ptr() as u32) });
-
-            // Debugging info
-            let amout = u.rxd.amount.read().bits();
-            rprintln!("Amount0: {}", amout);
-            for byte in cx.local.rx_buf1.iter(){
-                rprintln!("data0: {}", byte);
-            }
-            
-            // Status led; LED3
-            let rx_led = cx.local.rx_led1;
-            if rx_led.is_set_low().unwrap() {
-                rx_led.set_high().ok();
-            } else {
-                rx_led.set_low().ok();
-            }
-            // Reset the event.
-            u.events_endrx.write(|w| w);
-
-            // Now that this byte has been handled, start receiver in wait for another byte.
-            u.tasks_startrx.write(|w| unsafe { w.bits(1) });
-        });
-    }
-
-    #[task(shared=[uarte1], local = [tx_buf1])]
-    fn uart1_tx(mut cx: uart1_tx::Context){
-
-        cx.shared.uarte1.lock(|u| {
-            // Reset the events.
-            u.events_endtx.reset();
-            u.events_txstopped.reset();
-
-            u.txd.ptr.write(|w| unsafe { w.ptr().bits(cx.local.tx_buf1.as_ptr() as u32) });
-            u.txd.maxcnt.write(|w| unsafe { w.maxcnt().bits(cx.local.tx_buf1.len() as _) });
-
-            u.tasks_starttx.write(|w| unsafe { w.bits(1) });
-
-            // Wait for transmission to end.
-            while u.events_endtx.read().bits() == 0 {}
-
-            // Reset the event
-            u.events_txstopped.reset();
-
-            u.tasks_stoptx.write(|w| unsafe { w.bits(1) });
-        });
-
     }
 }
