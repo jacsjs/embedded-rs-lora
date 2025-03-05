@@ -28,7 +28,7 @@ mod app {
         #[lock_free]
         uarte1: UARTE1,
         #[lock_free]
-        rx_buf1: [u8; 4],
+        rx_buf1: [u8; 6],
         #[lock_free]
         timeout_timer: Timer<TIMER0>,
     }
@@ -83,7 +83,7 @@ mod app {
         uarte1.psel.rxd.write(|w| unsafe { w.bits(sen_rx.psel_bits()) });
         uarte1.psel.txd.write(|w| unsafe { w.bits(sen_tx.psel_bits()) });
 
-        let rx_buf1 = [0; 4];
+        let rx_buf1 = [0; 6];
         let tx_buf1 = "Hello Arduino!:D\n".as_bytes().try_into().unwrap();
 
         // Enable uarte peripheral.
@@ -122,7 +122,7 @@ mod app {
     #[task(binds = UARTE1, priority=5, shared=[uarte1, rx_buf1], local = [rx_led1])]
     fn rx_interrupt(mut cx: rx_interrupt::Context){
 
-        rprintln!("RX_INTERRUPT");
+        rprintln!("================RX_INTERRUPT=======================");
         // BEGIN STATE ENDRX
         if cx.shared.uarte1.events_endrx.read().events_endrx().bit() {
             rprintln!("STATE_ENDRX");
@@ -137,7 +137,14 @@ mod app {
 
             let test = cx.shared.uarte1.rxd.ptr.as_ptr();
 
+            rprintln!("Byte array: {:?}", cx.shared.rx_buf1);
+
             rprintln!("Since last time: {}", bytes_since_last);
+
+            if bytes_since_last < 6 {
+
+                rprintln!("LESS");
+            }
         } 
         // BEGIN STATE TIMEOUT
         else if cx.shared.uarte1.events_rxto.read().events_rxto().bit(){
@@ -157,6 +164,8 @@ mod app {
             let bytes_since_last = cx.shared.uarte1.rxd.amount.read().bits(); 
 
             let test = cx.shared.uarte1.rxd.ptr.as_ptr();
+
+            rprintln!("Byte array: {:?}", cx.shared.rx_buf1);
 
             rprintln!("Since last time: {}", bytes_since_last);
 
@@ -197,6 +206,15 @@ mod app {
 
             // ON(endrx)
             cx.shared.uarte1.intenset.write(|w| w.endrx().set() );
+
+            rprintln!("STOP_RX");
+            // From Nordic nrf datasheet:
+            //
+            // Note: If the ENDRX event has not been generated when the UARTE receiver stops, indicating that
+            // all pending content in the RX FIFO has been moved to the RX buffer, the UARTE will generate the
+            // ENDRX event explicitly even though the RX buffer is not full. In this scenario the ENDRX event will
+            // be generated before the RXTO event is generated.
+            cx.shared.uarte1.tasks_stoprx.write(|w| w.tasks_stoprx().set_bit() );
         }
     }        
 
