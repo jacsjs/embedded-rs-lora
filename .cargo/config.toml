@@ -1,7 +1,6 @@
 [target.thumbv7m-none-eabi]
 # uncomment this to make `cargo run` execute programs on QEMU
 # runner = "qemu-system-arm -cpu cortex-m3 -machine lm3s6965evb -nographic -semihosting-config enable=on,target=native -kernel"
-runner = "probe-rs run --chip nRF52840_xxAA"
 
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 # uncomment ONE of these three option to make `cargo run` start a GDB session
@@ -25,7 +24,7 @@ rustflags = [
   "link-arg=-Tlink.x",
 
   # Cross language LTO optimization
-  "-C", "linker-plugin-lto",
+  #"-C", "linker-plugin-lto",
 
   # if you run into problems with LLD switch to the GNU linker by commenting out
   # this line
