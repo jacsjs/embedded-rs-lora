@@ -1,7 +1,7 @@
 use nrf52840_hal::{timer::{self, Periodic}, Timer};
 use rtt_target::rprintln;
 
-const MAX_TRACE_ENTRIES: usize = 128; // Adjust as necessary
+const MAX_TRACE_ENTRIES: usize = 512; // Adjust as necessary
 
 pub enum TraceState {
     Endrx,
