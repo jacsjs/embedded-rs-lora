@@ -4,12 +4,11 @@
 use panic_halt as _;
 #[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0, SWI1_EGU1])]
 mod app {
-    use defmt::println;
     use rtt_target::{rprintln, rtt_init_print};
     use cortex_m::asm;
     use embedded_hal::digital::{OutputPin, StatefulOutputPin};
     use nrf52840_hal::{
-        gpio::{p0, Level, Output, Pin, PushPull}, pac::{aar::enable::W, TIMER1, TIMER3, TIMER4, UARTE1}, ppi::{self, ConfigurablePpi, Ppi}, timer::{self, Periodic}, Timer
+        gpio::{p0, Level, Output, Pin, PushPull}, pac::{TIMER1, TIMER3, TIMER4, UARTE1}, ppi::{self, ConfigurablePpi, Ppi}, timer::{self, Periodic}, Timer
     };
     use embedded_rs_lora::{
         mono::{ExtU32, MonoTimer}, 
@@ -25,7 +24,7 @@ mod app {
         #[lock_free]
         uarte1: UARTE1,
         #[lock_free]
-        data_buf: [u8; 256],
+        data_buf: [u8; 1024],
         #[lock_free]
         trace: Trace<TIMER4>,
     }
@@ -50,7 +49,6 @@ mod app {
         let p0 = p0::Parts::new(cx.device.P0);
         let ppi = ppi::Parts::new(cx.device.PPI);
         let uarte1 = cx.device.UARTE1;
-
 
         // This is the uarte timer.
         // It is supposed to use PPI, with compare event triggering tasks within
@@ -142,7 +140,7 @@ mod app {
         uarte1.psel.txd.write(|w| unsafe { w.bits(sen_tx.psel_bits()) });
 
         let rx_buf1 = [0; 6];
-        let data_buf = [0;256];
+        let data_buf = [0;1024];
 
         let trace = Trace::new(trace_timer);
 
@@ -203,7 +201,7 @@ mod app {
         let trace = cx.shared.trace;
 
         // BEGIN STATE TIMEOUT
-        if uarte.inten.read().rxto().bit_is_set() && uarte.events_rxto.read().events_rxto().bit(){
+        if uarte.events_rxto.read().events_rxto().bit() {
             uarte.events_endrx.reset();
             uarte.events_rxto.reset();
             
@@ -220,7 +218,7 @@ mod app {
         }
 
         // BEGIN STATE ENDRX
-        else if uarte.inten.read().endrx().bit_is_set() && uarte.events_endrx.read().events_endrx().bit() {
+        else if uarte.events_endrx.read().events_endrx().bit() {
             uarte.events_endrx.reset();
             
             let bytes_since_last = uarte.rxd.amount.read().bits(); 
@@ -238,13 +236,15 @@ mod app {
             let end_position: usize = *cx.local.data_current_len + bytes_since_last as usize;
 
             for i in 0..bytes_since_last as usize {
-                cx.shared.data_buf[*cx.local.data_current_len + i] = cx.local.rx_buf1[i];
+                // Testing/ debugging for now
+                //cx.shared.data_buf[*cx.local.data_current_len + i] = cx.local.rx_buf1[i];
             }
             *cx.local.data_current_len = end_position;
+            rprintln!("RX BUF: {:?}", cx.local.rx_buf1.utf8_chunks());
         } 
 
         // BEGIN STATE RXSTARTED
-        else if uarte.inten.read().rxstarted().bit_is_set() && uarte.events_rxstarted.read().events_rxstarted().bit() {
+        else if uarte.events_rxstarted.read().events_rxstarted().bit() {
             uarte.events_rxstarted.reset();
             uarte.events_endrx.reset();
 
@@ -256,6 +256,7 @@ mod app {
         }
 
         else {
+            // Undefined?
             trace.log(TraceState::Rxdrdy, 9999);
         }
     }        
