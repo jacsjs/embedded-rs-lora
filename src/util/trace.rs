@@ -1,11 +1,13 @@
 use nrf52840_hal::{timer::{self, Periodic}, Timer};
+use heapless::HistoryBuffer;
 use rtt_target::rprintln;
 
-const MAX_TRACE_ENTRIES: usize = 512; // Adjust as necessary
+const MAX_TRACE_ENTRIES: usize = 16;
 
 pub enum TraceState {
     Endrx,
-    Timeout,
+    Endtx,
+    RxTo,
     Rxstarted,
     Rxdrdy
 }
@@ -15,7 +17,8 @@ impl core::fmt::Display for TraceState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TraceState::Endrx => write!(f, "STATE_ENDRX    "),
-            TraceState::Timeout => write!(f, "STATE_TIMEOUT  "),
+            TraceState::Endtx => write!(f, "STATE_ENDTX    "),
+            TraceState::RxTo => write!(f, "STATE_RXTO     "),
             TraceState::Rxstarted => write!(f, "STATE_RXSTARTED"),
             TraceState::Rxdrdy => write!(f, "STATE_RXDRDY   "),
         }
@@ -33,9 +36,7 @@ where
     T: timer::Instance
 {
     timer: timer::Timer<T, Periodic>,
-    entries: [Option<TraceEntry>; MAX_TRACE_ENTRIES],
-    current_index: usize, // Track where we are for display purposes
-    stored_count: usize, // Track how many entries have been stored
+    entries: HistoryBuffer<TraceEntry, MAX_TRACE_ENTRIES>,
 }
 
 impl<T> Trace<T> 
@@ -46,9 +47,7 @@ where
         timer.start(u32::max_value());
         Trace {
             timer: timer,
-            entries: [const { None }; MAX_TRACE_ENTRIES],
-            current_index: 0, // Initialize at 0
-            stored_count: 0, // No entries stored initially
+            entries: HistoryBuffer::new(),
         }
     }
 
@@ -60,25 +59,24 @@ where
         // Get the timestamp directly at the time of logging
         let timestamp = self.timer.read();
         
-        self.entries[self.stored_count] = Some(TraceEntry {
+        let entry = TraceEntry {
             state,
             debug_var,
             timestamp
-        });
-        self.stored_count += 1;
+        };
+        self.entries.write(entry);
     }
 
     pub fn display_trace(&mut self) {
-        while self.current_index < self.stored_count {
-            if let Some(ref entry) = self.entries[self.current_index] {
-                rprintln!(
-                    "State: {} | Debug Var: {:<10} | Timestamp: {}",
-                    entry.state,
-                    entry.debug_var,
-                    entry.timestamp,
-                );
-                self.current_index += 1; // Move to the next index after printing
-            }
+        rprintln!("==================== Display Trace ====================");
+        for entry in self.entries.oldest_ordered() {
+            rprintln!(
+                "State: {} | Debug Var: {:<10} | Timestamp: {}",
+                entry.state,
+                entry.debug_var,
+                entry.timestamp,
+            );
         }
+        self.timer.task_clear().write(|w| w.tasks_clear().set_bit() );
     }
 }

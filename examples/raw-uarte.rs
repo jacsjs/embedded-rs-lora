@@ -1,54 +1,82 @@
 #![no_main]
 #![no_std]
 
-use panic_halt as _;
-#[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0, SWI1_EGU1])]
+use panic_rtt_target as _;
+#[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0, SWI1_EGU1, SWI2_EGU2, SWI3_EGU3])]
 mod app {
+    use core::{fmt::Debug, ops::{Deref, DerefMut, Index}};
+
+    use heapless::{spsc::{Consumer, Producer, Queue}, Vec};
+    use embedded_rs_lora::{
+        data_structures::double_buffer::{BufferConsumer, BufferProducer, DoubleBuffer, DoubleBufferConsumer, DoubleBufferProducer}, 
+        util::{
+            mono::{ExtU32, MonoTimer},
+            trace::{Trace, TraceState}}};
+    use heapless::String;
     use rtt_target::{rprintln, rtt_init_print};
     use cortex_m::asm;
     use embedded_hal::digital::{OutputPin, StatefulOutputPin};
     use nrf52840_hal::{
-        gpio::{p0, Level, Output, Pin, PushPull}, pac::{TIMER1, TIMER3, TIMER4, UARTE1}, ppi::{self, ConfigurablePpi, Ppi}, timer::{self, Periodic}, Timer
+        gpio::{p0, Level, Output, Pin, PushPull}, 
+        pac::{TIMER1, TIMER3, TIMER4, UARTE1}, 
+        ppi::{self, ConfigurablePpi, Ppi}, 
+        timer::Timer
     };
-    use embedded_rs_lora::{
-        mono::{ExtU32, MonoTimer}, 
-        trace::{Trace, TraceState}};
 
     #[monotonic(binds = TIMER1, default = true)]
     type MyMono = MonoTimer<TIMER1>;
 
-    const RXDRDY_TIMEOUT_CYCLES: u32 = 1_000_000;
+    const RXDRDY_TIMEOUT_CYCLES: u32 = 500_000;
+    const RX_BUF_SIZE_BYTES: usize =  256;
+    const TX_BUF_SIZE_BYTES: usize = 256;
 
     #[shared]
     struct Shared {
-        #[lock_free]
         uarte1: UARTE1,
-        #[lock_free]
-        data_buf: [u8; 1024],
         #[lock_free]
         trace: Trace<TIMER4>,
     }
 
     #[local]
     struct Local {
-        rx_buf1: [u8; 6],
         blink_led: Pin<Output<PushPull>>,
-        data_current_len: usize,
         uarte1_timer: Timer<TIMER3>,
+        rp: DoubleBufferProducer<'static, [u8; RX_BUF_SIZE_BYTES]>,
+        rc: DoubleBufferConsumer<'static, [u8; RX_BUF_SIZE_BYTES]>,
+        tp: Producer<'static, Vec<u8, TX_BUF_SIZE_BYTES>, 5>,
+        tc: Consumer<'static, Vec<u8, TX_BUF_SIZE_BYTES>, 5>,
     }
 
-    #[init]
+    #[init(local = [
+        rb: DoubleBuffer<[u8; RX_BUF_SIZE_BYTES]> = DoubleBuffer::new([0; RX_BUF_SIZE_BYTES], [0; RX_BUF_SIZE_BYTES]),
+        tq: Queue<Vec<u8, TX_BUF_SIZE_BYTES>, 5> = Queue::new(),
+    ])]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         rtt_init_print!();
 
         // Timers
         let mut mono = MonoTimer::new(cx.device.TIMER1);
-        let trace_timer = timer::Timer::into_periodic(timer::Timer::new(cx.device.TIMER4));
+
+        let trace_timer = Timer::into_periodic(Timer::new(cx.device.TIMER4));
+
+        let trace = Trace::new(trace_timer);
+        let (rp, rc) = cx.local.rb.split();
+        let (tp, tc) = cx.local.tq.split();
 
         // Ownership of Peripherals.
         let p0 = p0::Parts::new(cx.device.P0);
         let ppi = ppi::Parts::new(cx.device.PPI);
         let uarte1 = cx.device.UARTE1;
+        // Is the UART already on? It might be if you had a bootloader
+        if uarte1.enable.read().bits() != 0 {
+            uarte1.tasks_stoptx.write(|w| unsafe { w.bits(1) });
+            while uarte1.events_txstopped.read().bits() == 0 {
+                // Spin
+            }
+
+            // Disable UARTE instance
+            uarte1.enable.write(|w| w.enable().disabled());
+        }
 
         // This is the uarte timer.
         // It is supposed to use PPI, with compare event triggering tasks within
@@ -70,19 +98,15 @@ mod app {
         //
         // 
         cx.device.TIMER3.cc[0].write(|w| unsafe { w.bits(RXDRDY_TIMEOUT_CYCLES) });
-        let mut uarte1_timer = timer::Timer::new(cx.device.TIMER3).into_oneshot();
+        let mut uarte1_timer = Timer::new(cx.device.TIMER3).into_oneshot();
         uarte1_timer.enable_interrupt();
 
         // Task and event handles.
         let event_compare0_ref_for_ppi = uarte1_timer.event_compare_cc0();
-        let task_stoprx_ref_for_ppi = &uarte1.tasks_stoprx;
-
         let event_rdxrdy1_ref_for_ppi = &uarte1.events_rxdrdy;
+        let task_stoprx_ref_for_ppi = &uarte1.tasks_stoprx;
         let task_start_timer_ref_for_ppi = uarte1_timer.task_start();
         let task_clear_timer_ref_for_ppi = uarte1_timer.task_count();
-
-        let event_endrx_ref_for_ppi = &uarte1.events_endrx;
-        let task_stop_timer_ref_for_ppi = uarte1_timer.task_stop();
 
         // Setup PPI channel 0:    TIMER3.compare --------------> STOP_RX           CH[0].TEP
         //                                |              \------>                   CH[0].FORK
@@ -93,11 +117,6 @@ mod app {
         //
         // Setup PPI channel 1:    UARTE1.rxd_rdy --------------> TIMER3.start()    CH[1].TEP
         //                                               \------> TIMER3.clear()    CH[1].FORK
-        //
-        //
-        // Setup PPI channel 2:    UARTE1.end_rx ---------------> TIMER3.clear()    CH[1].TEP
-        //                                               \------> TIMER3_stop()     CH[1].FORK
-        //
         //
         // On each PPI channel, the signals are synchronized to the 16 MHz clock to avoid any internal violation
         // of setup and hold timings. As a consequence, events that are synchronous to the 16 MHz clock will be
@@ -116,12 +135,6 @@ mod app {
         ppi_channel1.set_fork_task_endpoint(task_clear_timer_ref_for_ppi);
         ppi_channel1.enable();
 
-        let mut ppi_channel2= ppi.ppi2;
-        ppi_channel2.set_event_endpoint(event_endrx_ref_for_ppi);
-        ppi_channel2.set_fork_task_endpoint(task_clear_timer_ref_for_ppi);
-        ppi_channel2.set_task_endpoint(task_stop_timer_ref_for_ppi);
-        ppi_channel2.enable();
-
         // LED for status.
         let blink_led = p0.p0_13.into_push_pull_output(Level::High).degrade();
 
@@ -136,129 +149,172 @@ mod app {
         uarte1.baudrate.write(|w| w.baudrate().baud9600());
 
         // Set RX and TX pins for uarte1 perhebial. 
-        uarte1.psel.rxd.write(|w| unsafe { w.bits(sen_rx.psel_bits()) });
-        uarte1.psel.txd.write(|w| unsafe { w.bits(sen_tx.psel_bits()) });
-
-        let rx_buf1 = [0; 6];
-        let data_buf = [0;1024];
-
-        let trace = Trace::new(trace_timer);
+        uarte1.psel.rxd.write(|w| unsafe { w.bits(sen_rx.psel_bits()).connect().connected() });
+        uarte1.psel.txd.write(|w| unsafe { w.bits(sen_tx.psel_bits()).connect().connected() });
 
         // Enable uarte peripheral.
         uarte1.enable.write(|w| w.enable().enabled());
-
 
         // When the start rx shortcut is triggered (after the buffer has been filled)
         // we want to prepare for the next buffer by flipping etc. (double buffered)
         // However, if the buffer is not full, it means we are done and we must disable
         // this shortcut in order for the timeout to be able to trigger.
         uarte1.intenset.write(|w| w.rxstarted().set_bit());
+
         // ON(endrx)
         uarte1.intenset.write(|w| w.endrx().set_bit() );
 
         // ON(rx_to)
         uarte1.intenset.write(|w| w.rxto().set_bit() ); 
 
-        // Set Easy DMA buffer addresses and size for transfer from rxd register.
-        uarte1.rxd.maxcnt.write(|w| unsafe { w.bits(rx_buf1.len() as u32) });
-        uarte1.rxd.ptr.write(|w| unsafe { w.ptr().bits(rx_buf1.as_ptr() as u32) });
-
         // Start the Uarte receiver.
         uarte1.tasks_startrx.write(|w| w.tasks_startrx().set_bit() );
 
+        uarte1.intenset.write(|w| w.error().set() );
+
         // Initiate periodic status blink, just as a sign of life.
         blink::spawn_after(1.secs(), mono.now()).unwrap();
+        display::spawn_after(3.secs(), mono.now()).unwrap();
 
-        (Shared { uarte1, data_buf, trace }, Local { rx_buf1, blink_led, data_current_len: 0, uarte1_timer}, init::Monotonics(mono))
+        (Shared { uarte1, trace }, Local { blink_led, uarte1_timer, rp, rc, tp, tc }, init::Monotonics(mono))
     }
 
     #[idle]
     fn idle(_cx: idle::Context) -> ! {
         loop {
+            //rprintln!("Sleeping...");
             asm::wfi();
         }
     }
 
-    #[task(priority=5, shared=[trace])]
-    fn process_trace(cx: process_trace::Context) {
+    #[task(priority=6, shared=[trace])]
+    fn display(cx: display::Context, instant: fugit::TimerInstantU32<1_000_000>){
         cx.shared.trace.display_trace();
+        let next_instant = instant + 3.secs();
+        display::spawn_at(next_instant, next_instant).unwrap();
+
+    }
+
+    // For this implementation, it's safest to assume and make sure
+    // uarte is not bidirectional. Hence the shared priority to guarantee
+    // that no preemption can occur. (Atleast not during cpu cycles).
+    #[task(priority = 4, shared=[uarte1], local=[tc])]
+    fn start_tx(mut cx: start_tx::Context, bytes_to_transmit: usize){
+        cx.shared.uarte1.lock(|uarte1|{
+            let buf = cx.local.tc.dequeue().unwrap();
+            // Reset the events.
+            uarte1.events_endtx.reset();
+            uarte1.events_txstopped.reset();
+            // Set Easy DMA buffer addresses and size for transfer from tdx buffer.
+            uarte1.txd.ptr.write(|w| unsafe { w.ptr().bits(buf.as_ptr() as u32) });
+            uarte1.txd.maxcnt.write(|w| unsafe { w.bits(buf.len() as u32) });
+
+            // ON(endtx)
+            uarte1.intenset.write(|w| w.endtx().set() );
+
+            // Start transmission
+            uarte1.tasks_starttx.write(|w| w.tasks_starttx().set_bit() );
+        });
+    }
+
+    // Process the currently completed rx_buffer
+    // in the background with lower priority.
+    #[task(priority=5, shared=[], local=[rc, tp])]
+    fn process_rxbuffer(cx: process_rxbuffer::Context, bytes_to_process: usize) {
+        let buf = cx.local.rc.consume().split_at(bytes_to_process).0;
+        rprintln!("Buffer Len: {}", bytes_to_process);
+        //rprintln!("buf addr: {:?}", buf.as_ptr());
+        rprintln!("RX Buf: {:?}", buf.utf8_chunks());
+
+        let buf = heapless::Vec::<u8, 256>::from_slice(
+            //&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+            b"AT+ID\r\n"
+        ).unwrap();
+        cx.local.tp.enqueue(buf).unwrap();
+ 
+        start_tx::spawn(7).unwrap();
     }
 
     // Same priority as the corresponding interrupt, in order to share lock-free variables.
     // They wont interleave anyways because that's the entire point of this async function.
     // Its called asynchronously when a uart1_timer.compare event iss triggered.
-    #[task(binds = TIMER3, priority=5, shared=[uarte1], local=[uarte1_timer])]
-    fn rx_timeout(cx: rx_timeout::Context){
-        cx.local.uarte1_timer.reset_event();
-        cx.shared.uarte1.shorts.reset();
-        process_trace::spawn_after(2.secs()).unwrap();
+    #[task(binds = TIMER3, priority=6, shared=[uarte1], local=[uarte1_timer])]
+    fn rx_timeout(mut cx: rx_timeout::Context){
+        cx.shared.uarte1.lock(|uarte1|{
+            cx.local.uarte1_timer.reset_event();
+            uarte1.shorts.reset();
+        });
     }
 
     // Highest priority; we wouldn't want to miss any precious data would we?
-    #[task(binds = UARTE1, priority=5, shared=[data_buf, trace, uarte1], local = [rx_buf1, data_current_len])]
-    fn rx_interrupt(cx: rx_interrupt::Context){
-        let uarte = cx.shared.uarte1;
-        let trace = cx.shared.trace;
+    #[task(binds = UARTE1, priority=6, shared=[trace, uarte1], local = [rp])]
+    fn uarte1_interrupt(mut cx: uarte1_interrupt::Context){
+        cx.shared.uarte1.lock(| uarte| {
+            let trace = cx.shared.trace;
 
-        // BEGIN STATE TIMEOUT
-        if uarte.events_rxto.read().events_rxto().bit() {
-            uarte.events_endrx.reset();
-            uarte.events_rxto.reset();
-            
-            trace.log(TraceState::Timeout, uarte.rxd.amount.read().bits() as usize);
+            // BEGIN STATE TIMEOUT
+            if uarte.events_rxto.read().events_rxto().bit() {
+                uarte.events_endrx.reset();
+                uarte.events_rxto.reset();
+                
+                trace.log(TraceState::RxTo, uarte.rxd.amount.read().bits() as usize);
 
-            uarte.shorts.write(|w| { w.endrx_startrx().enabled() });
-            // HERE WE WANT TO PROCESS THE BUFFER BEFORE A NEW ONE IS STARTING TO FILL
-            // IF WE DO NOT TAKE CARE OF BYTES IN THE BUFFER UNTIL THIS ISR ENDS
-            // STARTRX WILL START FILLING THE BUFFER AGAIN, AND WE LOSE DATA.
+                uarte.shorts.write(|w| { w.endrx_startrx().enabled() });
 
-            // FLUSH RXD into BUFFER. 
-            // Up to 4 bytes are received after END_RX before TIMEOUT is triggered.
-            uarte.tasks_flushrx.write(|w| w.tasks_flushrx().set_bit() );
-        }
+                // TODO: consider spawning "process_rxbuffer" here aswell in
+                // edge-cases where we have almost full buffer yet bytes on
+                // the rdx line waiting for a flush_rx operation.
 
-        // BEGIN STATE ENDRX
-        else if uarte.events_endrx.read().events_endrx().bit() {
-            uarte.events_endrx.reset();
-            
-            let bytes_since_last = uarte.rxd.amount.read().bits(); 
-            trace.log(TraceState::Endrx, bytes_since_last as usize);
-
-            // Buffer processing.
-            // Here maybe I should offload buffer handlinng to a software task with lower priority
-            // or maybe setup PPI?
-            // I dont know if it will work, since the buffer is starting to fill as soon as we leave this interrupt
-            // oh wait, it said it is double buffered, maybe I can setup the new buffer in RX_STARTED
-            // that has a shortcut so it 100% happens after endRX.
-            // which means I setup the new buffer, then RXDRDY spawns
-            // which means I can process the currently filled buffer after RXDRDY (which is pointing to the new buffer)
-            // In this way, I can process the old (current) buffer while the new one is filling via easyDMA! :D
-            let end_position: usize = *cx.local.data_current_len + bytes_since_last as usize;
-
-            for i in 0..bytes_since_last as usize {
-                // Testing/ debugging for now
-                //cx.shared.data_buf[*cx.local.data_current_len + i] = cx.local.rx_buf1[i];
+                // FLUSH RXD into BUFFER. 
+                // Up to 4 bytes are received after END_RX before TIMEOUT is triggered.
+                uarte.tasks_flushrx.write(|w| w.tasks_flushrx().set_bit() );
             }
-            *cx.local.data_current_len = end_position;
-            rprintln!("RX BUF: {:?}", cx.local.rx_buf1.utf8_chunks());
-        } 
 
-        // BEGIN STATE RXSTARTED
-        else if uarte.events_rxstarted.read().events_rxstarted().bit() {
-            uarte.events_rxstarted.reset();
-            uarte.events_endrx.reset();
+            // BEGIN STATE ENDRX
+            else if uarte.events_endrx.read().events_endrx().bit() {
+                uarte.events_endrx.reset();
+                
+                let bytes_that_require_processing = uarte.rxd.amount.read().bits(); 
+                trace.log(TraceState::Endrx, bytes_that_require_processing as usize);
 
-            trace.log(TraceState::Rxstarted, uarte.rxd.amount.read().bits() as usize);
+                // Start processing buffer in background with lower priority.
+                // The buffer is double buffered which means when this ISR exits,
+                // the rx_started event will begin, swapping the buffer and starting to fill the other one,
+                // while we still process the current one here.
+                process_rxbuffer::spawn(bytes_that_require_processing as usize).ok().unwrap();
+            } 
 
-            // Set Easy DMA buffer addresses and size for transfer from rxd register.
-            uarte.rxd.maxcnt.write(|w| unsafe { w.bits(cx.local.rx_buf1.len() as u32) });
-            uarte.rxd.ptr.write(|w| unsafe { w.ptr().bits(cx.local.rx_buf1.as_ptr() as u32) });
-        }
+            // BEGIN STATE RXSTARTED
+            else if uarte.events_rxstarted.read().events_rxstarted().bit() {
+                uarte.events_rxstarted.reset();
+                uarte.events_endrx.reset();
 
-        else {
-            // Undefined?
-            trace.log(TraceState::Rxdrdy, 9999);
-        }
+                trace.log(TraceState::Rxstarted, 0);
+                //Swap buffer.
+                cx.local.rp.swap();
+
+                // Set Easy DMA buffer addresses and size for transfer from rxd register.
+                uarte.rxd.maxcnt.write(|w| unsafe { w.bits(RX_BUF_SIZE_BYTES as u32) });
+                uarte.rxd.ptr.write(|w| unsafe { w.ptr().bits(cx.local.rp.as_ref().as_ptr() as u32) });
+
+            }
+
+            // BEGIN STATE ENDTX
+            if uarte.events_endtx.read().events_endtx().bit() {
+                uarte.events_endtx.reset();
+                uarte.tasks_stoptx.write(|w| w.tasks_stoptx().set_bit() );
+
+                trace.log(TraceState::Endtx, uarte.txd.amount.read().bits() as usize);
+                //let bytes_transmitted = uarte.txd.amount.read().bits();
+            }
+
+            // BEGIN STATE ERROR
+            if uarte.events_error.read().events_error().bit() {
+                // Undefined?
+                rprintln!("error: {}", uarte.errorsrc.read().bits());
+                uarte.events_error.reset();
+            }
+        });
     }        
 
     // Lowest priority.
@@ -270,7 +326,7 @@ mod app {
         } else {
             led.set_low().ok();
         }
-        let next_instant = instant + 1000.millis();
+        let next_instant = instant + 2000.millis();
         blink::spawn_at(next_instant, next_instant).unwrap();
     }
 }

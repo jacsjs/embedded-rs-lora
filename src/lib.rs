@@ -1,8 +1,10 @@
 #![no_std]
 #![no_main]
-pub mod mono;
 pub mod at_command_handler;
-pub mod trace;
+pub mod util;
+pub mod data_structures;
+pub mod interrupt_uarte;
+
 
 #[cfg(test)]
 use defmt_rtt as _; // global logger
@@ -10,7 +12,7 @@ use defmt_rtt as _; // global logger
 // use some_hal as _; // memory layout
 use nrf52840_hal as _; // memory layout
 
-use panic_halt as _;
+use panic_rtt_target as _;
 
 // defmt-test 0.3.0 has the limitation that this `#[tests]` attribute can only be used
 // once within a crate. the module can be in any file but there can only be at most

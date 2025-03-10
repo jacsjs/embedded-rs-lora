@@ -1,10 +1,12 @@
 #![no_main]
 #![no_std]
 
-use panic_halt as _;
+use panic_rtt_target as _;
 #[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0])]
 mod app {
-    use embedded_rs_lora::{at_command_handler::AtCommandHandler, mono::{ExtU32, MonoTimer}};
+    use rtt_target::{rprintln, rtt_init_print};
+    use embedded_rs_lora::at_command_handler::AtCommandHandler;
+    use embedded_rs_lora::util::mono::{ExtU32, MonoTimer};
     use embedded_hal::digital::{OutputPin, StatefulOutputPin};
     use cortex_m::asm;
     use nrf52840_hal::{
@@ -42,6 +44,7 @@ mod app {
 
     #[init]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
+        rtt_init_print!();
 
         let mut mono = MonoTimer::new(cx.device.TIMER1);
 
@@ -95,10 +98,11 @@ mod app {
 
         // Result is collected for 20 µs.
         let result = ctx.local.saadc.read_channel(&mut pins.pin3).unwrap();
+        rprintln!("Result: {}", result);
 
         // Send result as AT command.
         match ctx.local.at.set_no_response(ctx.local.com_buf,  
-            |builder| builder.named("+TMPC_S").with_int_parameter(result).finish())
+            |builder| builder.named("+TEST").finish())
             {
                 Ok(_) => (),
                 Err(_) => ()

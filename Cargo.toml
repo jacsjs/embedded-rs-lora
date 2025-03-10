@@ -8,6 +8,9 @@ bench = false
 [lib]
 harness = false
 
+[features]
+52840 = []
+
 # needed for each integration test
 [[test]]
 name = "integration"
@@ -20,7 +23,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-at-commands = "0.5.5"
 cortex-m = { version = "0.7.7", features = [
     "inline-asm",
     "critical-section-single-core",
@@ -28,13 +30,14 @@ cortex-m = { version = "0.7.7", features = [
 cortex-m-rtic = "1.1.4"
 embedded-hal = "1.0.0"
 fugit = "0.3.7"
-lora-phy = "3.0.1"
-lorawan-device = "0.12.2"
 nrf52840-hal = "0.18.0"
-panic-halt = "1.0.0"
 rtic-monotonic = "1.0.0"
 rtt-target = "0.6.1"
 defmt = "0.3.10"
+rtic-sync = "1.3.0"
+at-commands = "0.5.5"
+heapless = "0.8.0"
+panic-rtt-target = "0.2.0"
 
 [dev-dependencies]
 defmt-rtt = "0.4.1"
