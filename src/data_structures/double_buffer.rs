@@ -84,7 +84,7 @@ impl<'a, T> BufferConsumer<'a, T> for  DoubleBufferConsumer<'a, T> {
 
 impl<'a, T> BufferProducer<'a, T> for DoubleBufferProducer<'a, T> {
     #[inline(always)]
-    fn produce(&self, data: &T, data_size: usize) {
+    fn produce(&self, _data: &T, _data_size: usize) {
     }
     #[inline(always)]
     fn as_ref(&self) -> &T {

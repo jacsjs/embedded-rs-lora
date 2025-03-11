@@ -1,6 +1,5 @@
 use at_commands::{builder::{CommandBuilder, Execute, Initialized, Query, Set}, parser::{CommandParser, ParseError}};
 use nrf52840_hal::{timer, uarte, Timer, Uarte};
-use rtt_target::rprint;
 
 /// Handler for managing AT commands on the nrf52840 device.
 /// Must attach a [Uarte] peripheral for serial communication consisting of AT requests and responses.

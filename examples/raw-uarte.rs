@@ -4,15 +4,6 @@
 use panic_rtt_target as _;
 #[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0, SWI1_EGU1, SWI2_EGU2, SWI3_EGU3])]
 mod app {
-    use core::{fmt::Debug, ops::{Deref, DerefMut, Index}};
-
-    use heapless::{spsc::{Consumer, Producer, Queue}, Vec};
-    use embedded_rs_lora::{
-        data_structures::double_buffer::{BufferConsumer, BufferProducer, DoubleBuffer, DoubleBufferConsumer, DoubleBufferProducer}, 
-        util::{
-            mono::{ExtU32, MonoTimer},
-            trace::{Trace, TraceState}}};
-    use heapless::String;
     use rtt_target::{rprintln, rtt_init_print};
     use cortex_m::asm;
     use embedded_hal::digital::{OutputPin, StatefulOutputPin};
@@ -22,19 +13,28 @@ mod app {
         ppi::{self, ConfigurablePpi, Ppi}, 
         timer::Timer
     };
+    use heapless::{
+        spsc::{Consumer, Producer, Queue}, FnvIndexMap, Vec};
+    use embedded_rs_lora::{
+        data_structures::double_buffer::{BufferConsumer, BufferProducer, DoubleBuffer, DoubleBufferConsumer, DoubleBufferProducer}, 
+        util::{
+            mono::{ExtU32, MonoTimer},
+            trace::{Trace, TraceState}}};
 
     #[monotonic(binds = TIMER1, default = true)]
     type MyMono = MonoTimer<TIMER1>;
 
     const RXDRDY_TIMEOUT_CYCLES: u32 = 500_000;
     const RX_BUF_SIZE_BYTES: usize =  256;
-    const TX_BUF_SIZE_BYTES: usize = 256;
+    const QUEUE_SIZE: usize = 8;
 
     #[shared]
     struct Shared {
         uarte1: UARTE1,
         #[lock_free]
         trace: Trace<TIMER4>,
+        #[lock_free]
+        response_actions: FnvIndexMap::<Vec<u8, 5>, RxAction, 8>,
     }
 
     #[local]
@@ -43,38 +43,41 @@ mod app {
         uarte1_timer: Timer<TIMER3>,
         rp: DoubleBufferProducer<'static, [u8; RX_BUF_SIZE_BYTES]>,
         rc: DoubleBufferConsumer<'static, [u8; RX_BUF_SIZE_BYTES]>,
-        tp: Producer<'static, Vec<u8, TX_BUF_SIZE_BYTES>, 5>,
-        tc: Consumer<'static, Vec<u8, TX_BUF_SIZE_BYTES>, 5>,
+        tx_queue_producer: Producer<'static, Vec<u8, RX_BUF_SIZE_BYTES>, QUEUE_SIZE>,
+        tx_queue_consumer: Consumer<'static, Vec<u8, RX_BUF_SIZE_BYTES>, QUEUE_SIZE>,
     }
 
     #[init(local = [
         rb: DoubleBuffer<[u8; RX_BUF_SIZE_BYTES]> = DoubleBuffer::new([0; RX_BUF_SIZE_BYTES], [0; RX_BUF_SIZE_BYTES]),
-        tq: Queue<Vec<u8, TX_BUF_SIZE_BYTES>, 5> = Queue::new(),
+        tx_queue: Queue<Vec<u8, RX_BUF_SIZE_BYTES>, QUEUE_SIZE> = Queue::new(),
     ])]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         rtt_init_print!();
 
         // Timers
         let mut mono = MonoTimer::new(cx.device.TIMER1);
-
         let trace_timer = Timer::into_periodic(Timer::new(cx.device.TIMER4));
 
         let trace = Trace::new(trace_timer);
+
         let (rp, rc) = cx.local.rb.split();
-        let (tp, tc) = cx.local.tq.split();
+        let (tx_queue_producer, tx_queue_consumer) = cx.local.tx_queue.split();
+
+        // Heapless hashmap of AT tags and actions, for dynamic decision making
+        // of asynchronous tx/rx events.
+        let response_actions = FnvIndexMap::new();
 
         // Ownership of Peripherals.
         let p0 = p0::Parts::new(cx.device.P0);
         let ppi = ppi::Parts::new(cx.device.PPI);
         let uarte1 = cx.device.UARTE1;
-        // Is the UART already on? It might be if you had a bootloader
-        if uarte1.enable.read().bits() != 0 {
-            uarte1.tasks_stoptx.write(|w| unsafe { w.bits(1) });
-            while uarte1.events_txstopped.read().bits() == 0 {
-                // Spin
-            }
 
-            // Disable UARTE instance
+        // Maybe this is not needed, I just included it as a precaution.
+        if uarte1.enable.read().bits() != 0 {
+
+            uarte1.tasks_stoptx.write(|w| unsafe { w.bits(1) });
+            while uarte1.events_txstopped.read().bits() == 0 {}
+
             uarte1.enable.write(|w| w.enable().disabled());
         }
 
@@ -175,14 +178,15 @@ mod app {
         // Initiate periodic status blink, just as a sign of life.
         blink::spawn_after(1.secs(), mono.now()).unwrap();
         display::spawn_after(3.secs(), mono.now()).unwrap();
+        test_uarte::spawn().ok().unwrap();
 
-        (Shared { uarte1, trace }, Local { blink_led, uarte1_timer, rp, rc, tp, tc }, init::Monotonics(mono))
+        (Shared { uarte1, trace, response_actions}, Local { blink_led, uarte1_timer, rp, rc, tx_queue_producer, tx_queue_consumer }, init::Monotonics(mono))
     }
 
     #[idle]
     fn idle(_cx: idle::Context) -> ! {
         loop {
-            //rprintln!("Sleeping...");
+            rprintln!("Sleeping...");
             asm::wfi();
         }
     }
@@ -194,45 +198,101 @@ mod app {
         display::spawn_at(next_instant, next_instant).unwrap();
 
     }
+    pub enum RxAction {
+        ATID,
+        ATTEST,
+        ATMODE,
+    }
+    impl core::fmt::Debug for RxAction {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                RxAction::ATID =>   write!(f, "ATID  "),
+                RxAction::ATTEST => write!(f, "ATTEST"),
+                RxAction::ATMODE => write!(f, "ATMODE"),
+            }
+        }
+    }
 
-    // For this implementation, it's safest to assume and make sure
-    // uarte is not bidirectional. Hence the shared priority to guarantee
-    // that no preemption can occur. (Atleast not during cpu cycles).
-    #[task(priority = 4, shared=[uarte1], local=[tc])]
-    fn start_tx(mut cx: start_tx::Context, bytes_to_transmit: usize){
+    #[task(priority=4, shared=[response_actions], local=[tx_queue_producer])]
+    fn test_uarte(cx: test_uarte::Context){
+        // Simulate TX for now.
+        // Later this method will receive commands from other tasks
+        // such as sensor collection tasks, or network watchdogs.
+        let example_tag= heapless::Vec::<u8, 5>::from_slice(
+            b"+ID"
+        ).unwrap();
+        let example_msg= heapless::Vec::<u8, 256>::from_slice(
+            b"AT+ID\r\n"
+        ).unwrap();
+
+        // Prepare the proper data structures for sending.
+        cx.shared.response_actions.insert(example_tag, RxAction::ATTEST).unwrap();
+        cx.local.tx_queue_producer.enqueue(example_msg).unwrap();
+
+        // Pre-sending preparations done, can send now!
+        start_tx::spawn().unwrap();
+    }
+
+    /// Start tx from the tag_msg_map queue, if there is a transmission pending.
+    /// TODO: temporarily panics if the queue is empty; during testing only.
+    #[task(priority = 4, shared=[uarte1], local=[tx_queue_consumer])]
+    fn start_tx(mut cx: start_tx::Context){
         cx.shared.uarte1.lock(|uarte1|{
-            let buf = cx.local.tc.dequeue().unwrap();
-            // Reset the events.
-            uarte1.events_endtx.reset();
-            uarte1.events_txstopped.reset();
-            // Set Easy DMA buffer addresses and size for transfer from tdx buffer.
-            uarte1.txd.ptr.write(|w| unsafe { w.ptr().bits(buf.as_ptr() as u32) });
-            uarte1.txd.maxcnt.write(|w| unsafe { w.bits(buf.len() as u32) });
 
-            // ON(endtx)
-            uarte1.intenset.write(|w| w.endtx().set() );
+            // Check if there is work to be done...
+            if let Some(msg) = cx.local.tx_queue_consumer.dequeue() {
 
-            // Start transmission
-            uarte1.tasks_starttx.write(|w| w.tasks_starttx().set_bit() );
+                // Reset the events.
+                uarte1.events_endtx.reset();
+                uarte1.events_txstopped.reset();
+
+                // Set Easy DMA buffer addresses based on the message memory address and size.
+                uarte1.txd.ptr.write(|w| unsafe { w.ptr().bits(msg.as_ptr() as u32) });
+                uarte1.txd.maxcnt.write(|w| unsafe { w.bits(msg.len() as u32) });
+
+                rprintln!("tx msg: {:?}", msg.utf8_chunks());
+
+                // ON(endtx)
+                uarte1.intenset.write(|w| w.endtx().set() );
+
+                // Start transmission
+                uarte1.tasks_starttx.write(|w| w.tasks_starttx().set_bit() );
+
+            } else {
+                // Something here to try again after a while?
+                rprintln!("empty tx work-queue");
+            }
         });
     }
 
+
     // Process the currently completed rx_buffer
     // in the background with lower priority.
-    #[task(priority=5, shared=[], local=[rc, tp])]
-    fn process_rxbuffer(cx: process_rxbuffer::Context, bytes_to_process: usize) {
+    #[task(priority=4, shared=[response_actions], local=[rc])]
+    fn process_rx(cx: process_rx::Context, bytes_to_process: usize) {
         let buf = cx.local.rc.consume().split_at(bytes_to_process).0;
-        rprintln!("Buffer Len: {}", bytes_to_process);
-        //rprintln!("buf addr: {:?}", buf.as_ptr());
-        rprintln!("RX Buf: {:?}", buf.utf8_chunks());
+        if buf.is_empty() { return } 
+        let res_slice = buf.split(|&b| b == b':').nth(0).unwrap();
+        let res_tag = match Vec::<u8, 5>::from_slice(res_slice) {
+            Ok(v) => v,
+            Err(e) => {
+                rprintln!("Error in process_rx: {:?}", e);
+                Vec::<u8, 5>::new()
+            },
+        };
+        if cx.shared.response_actions.contains_key(&res_tag) {
+            // It was an expected response, fire it's mapped action.
+            let action = cx.shared.response_actions.get(&res_tag).unwrap();
+            rprintln!("rx msg: {:?}", buf.utf8_chunks());
+            rprintln!("Action to take: {:?}", action);
 
-        let buf = heapless::Vec::<u8, 256>::from_slice(
-            //&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
-            b"AT+ID\r\n"
-        ).unwrap();
-        cx.local.tp.enqueue(buf).unwrap();
- 
-        start_tx::spawn(7).unwrap();
+        } else {
+            // Async message from the world outside. In need of further
+            // processing to determine what they want.
+            rprintln!("Not awaited response is: {:?}", res_slice);
+        }
+        // Just redo the test, for fun
+        test_uarte::spawn_after(fugit::TimerDurationU32::from_ticks(1_000_000)).unwrap();
     }
 
     // Same priority as the corresponding interrupt, in order to share lock-free variables.
@@ -251,7 +311,6 @@ mod app {
     fn uarte1_interrupt(mut cx: uarte1_interrupt::Context){
         cx.shared.uarte1.lock(| uarte| {
             let trace = cx.shared.trace;
-
             // BEGIN STATE TIMEOUT
             if uarte.events_rxto.read().events_rxto().bit() {
                 uarte.events_endrx.reset();
@@ -269,7 +328,6 @@ mod app {
                 // Up to 4 bytes are received after END_RX before TIMEOUT is triggered.
                 uarte.tasks_flushrx.write(|w| w.tasks_flushrx().set_bit() );
             }
-
             // BEGIN STATE ENDRX
             else if uarte.events_endrx.read().events_endrx().bit() {
                 uarte.events_endrx.reset();
@@ -278,12 +336,11 @@ mod app {
                 trace.log(TraceState::Endrx, bytes_that_require_processing as usize);
 
                 // Start processing buffer in background with lower priority.
-                // The buffer is double buffered which means when this ISR exits,
-                // the rx_started event will begin, swapping the buffer and starting to fill the other one,
-                // while we still process the current one here.
-                process_rxbuffer::spawn(bytes_that_require_processing as usize).ok().unwrap();
+                match process_rx::spawn(bytes_that_require_processing as usize) {
+                    Ok(_) => (),
+                    Err(err) => rprintln!("Error: Process_rxbuffer task already pending! {:?}", err),
+                }
             } 
-
             // BEGIN STATE RXSTARTED
             else if uarte.events_rxstarted.read().events_rxstarted().bit() {
                 uarte.events_rxstarted.reset();
@@ -298,16 +355,21 @@ mod app {
                 uarte.rxd.ptr.write(|w| unsafe { w.ptr().bits(cx.local.rp.as_ref().as_ptr() as u32) });
 
             }
-
             // BEGIN STATE ENDTX
             if uarte.events_endtx.read().events_endtx().bit() {
                 uarte.events_endtx.reset();
                 uarte.tasks_stoptx.write(|w| w.tasks_stoptx().set_bit() );
 
-                trace.log(TraceState::Endtx, uarte.txd.amount.read().bits() as usize);
-                //let bytes_transmitted = uarte.txd.amount.read().bits();
-            }
+                let bytes_transmitted = uarte.txd.amount.read().bits();
+                trace.log(TraceState::Endtx, bytes_transmitted as usize);
 
+                // Done! Mark next transmission as pending, 
+                // if it's not already pending by another task of course.
+                match start_tx::spawn() {
+                    Ok(_) => (),
+                    Err(err) => rprintln!("Error: start_tx task already pending! {:?}", err),
+                }
+            }
             // BEGIN STATE ERROR
             if uarte.events_error.read().events_error().bit() {
                 // Undefined?
@@ -326,7 +388,7 @@ mod app {
         } else {
             led.set_low().ok();
         }
-        let next_instant = instant + 2000.millis();
+        let next_instant = instant + 1.secs();
         blink::spawn_at(next_instant, next_instant).unwrap();
     }
 }

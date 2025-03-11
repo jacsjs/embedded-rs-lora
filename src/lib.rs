@@ -3,7 +3,6 @@
 pub mod at_command_handler;
 pub mod util;
 pub mod data_structures;
-pub mod interrupt_uarte;
 
 
 #[cfg(test)]
