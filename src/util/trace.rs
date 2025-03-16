@@ -2,7 +2,7 @@ use nrf52840_hal::{timer::{self, Periodic}, Timer};
 use heapless::HistoryBuffer;
 use rtt_target::rprintln;
 
-const MAX_TRACE_ENTRIES: usize = 32;
+const MAX_TRACE_ENTRIES: usize = 14;
 
 pub enum TraceState {
     Endrx,
@@ -77,6 +77,6 @@ where
                 entry.timestamp,
             );
         }
-        self.timer.task_clear().write(|w| w.tasks_clear().set_bit() );
+        //self.timer.task_clear().write(|w| w.tasks_clear().set_bit() );
     }
 }
