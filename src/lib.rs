@@ -1,10 +1,9 @@
 #![no_std]
 #![no_main]
 pub mod at_command_handler;
-pub mod util;
 pub mod data_structures;
 pub mod message_handler;
-
+pub mod util;
 
 #[cfg(test)]
 use defmt_rtt as _; // global logger

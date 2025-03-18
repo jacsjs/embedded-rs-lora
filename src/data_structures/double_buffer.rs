@@ -1,5 +1,5 @@
-use core::sync::atomic::AtomicBool;
 use core::fmt::{Debug, Formatter};
+use core::sync::atomic::AtomicBool;
 
 pub trait BufferProducer<'a, T> {
     fn produce(&self, data: &T, data_size: usize);
@@ -17,12 +17,16 @@ pub struct DoubleBuffer<T> {
 impl<T> DoubleBuffer<T> {
     #[inline]
     pub const fn new(current: T, next: T) -> Self {
-        Self { swapped: AtomicBool::new(false), buffers: [current, next] }
+        Self {
+            swapped: AtomicBool::new(false),
+            buffers: [current, next],
+        }
     }
 
     #[inline]
     pub fn swap(&self) {
-        self.swapped.fetch_not(core::sync::atomic::Ordering::Relaxed);
+        self.swapped
+            .fetch_not(core::sync::atomic::Ordering::Relaxed);
     }
 
     #[inline]
@@ -51,9 +55,12 @@ impl<T> DoubleBuffer<T> {
         &self.buffers[self.next_offset()]
     }
 
-    pub fn split(&mut self) -> (DoubleBufferProducer<'_, T>, DoubleBufferConsumer<'_, T>){
-        ( DoubleBufferProducer { buf: self }, DoubleBufferConsumer { buf: self })
-    } 
+    pub fn split(&mut self) -> (DoubleBufferProducer<'_, T>, DoubleBufferConsumer<'_, T>) {
+        (
+            DoubleBufferProducer { buf: self },
+            DoubleBufferConsumer { buf: self },
+        )
+    }
 }
 impl<T: Debug> Debug for DoubleBuffer<T> {
     #[inline]
@@ -75,7 +82,7 @@ pub struct DoubleBufferProducer<'a, T> {
 unsafe impl<'a, T> Send for DoubleBufferConsumer<'a, T> where T: Send {}
 unsafe impl<'a, T> Send for DoubleBufferProducer<'a, T> where T: Send {}
 
-impl<'a, T> BufferConsumer<'a, T> for  DoubleBufferConsumer<'a, T> {
+impl<'a, T> BufferConsumer<'a, T> for DoubleBufferConsumer<'a, T> {
     #[inline(always)]
     fn consume(&self) -> &T {
         self.buf.current()
@@ -84,15 +91,14 @@ impl<'a, T> BufferConsumer<'a, T> for  DoubleBufferConsumer<'a, T> {
 
 impl<'a, T> BufferProducer<'a, T> for DoubleBufferProducer<'a, T> {
     #[inline(always)]
-    fn produce(&self, _data: &T, _data_size: usize) {
-    }
+    fn produce(&self, _data: &T, _data_size: usize) {}
     #[inline(always)]
     fn as_ref(&self) -> &T {
         self.buf.current()
     }
 }
 
-impl<'a, T> DoubleBufferProducer<'a,T> {
+impl<'a, T> DoubleBufferProducer<'a, T> {
     #[inline(always)]
     pub fn swap(&self) {
         self.buf.swap();

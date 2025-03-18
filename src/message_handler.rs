@@ -1,11 +1,14 @@
 use core::ops::Deref;
 
-use heapless::{object_pool, pool::object::{Object, ObjectBlock}};
+use heapless::{
+    object_pool,
+    pool::object::{Object, ObjectBlock},
+};
 use nrf52840_hal::{
-    gpio::{Floating, Input, Output, Pin, PushPull}, 
-    pac::{uarte0, UARTE0, UARTE1}, 
+    gpio::{Floating, Input, Output, Pin, PushPull},
+    pac::{uarte0, UARTE0, UARTE1},
     ppi::ConfigurablePpi,
-    timer
+    timer,
 };
 
 pub trait Instance: Deref<Target = uarte0::RegisterBlock> {
@@ -39,7 +42,7 @@ const POOL_CAPACITY: usize = 4;
 
 object_pool!(RxPool: [u8; MSG_BUF_SIZE]);
 object_pool!(TxPool: [u8; MSG_BUF_SIZE]);
-struct MessageHandler<U, T, P1, P2> 
+struct MessageHandler<U, T, P1, P2>
 where
     U: Instance,
     T: timer::Instance,
@@ -61,7 +64,14 @@ where
     P1: ConfigurablePpi,
     P2: ConfigurablePpi,
 {
-    fn new(uarte: U, timer: T, mut ppi1: P1, mut ppi2: P2, rxp: Pin<Input<Floating>>, txp: Pin<Output<PushPull>>) -> Self {
+    fn new(
+        uarte: U,
+        timer: T,
+        mut ppi1: P1,
+        mut ppi2: P2,
+        rxp: Pin<Input<Floating>>,
+        txp: Pin<Output<PushPull>>,
+    ) -> Self {
         if uarte.enable.read().bits() != 0 {
             uarte.tasks_stoptx.write(|w| unsafe { w.bits(1) });
             while uarte.events_txstopped.read().bits() == 0 {}
@@ -69,15 +79,21 @@ where
         }
         let rx_blocks: &'static mut [ObjectBlock<[u8; MSG_BUF_SIZE]>] = {
             const BLOCK: ObjectBlock<[u8; MSG_BUF_SIZE]> = ObjectBlock::new([0; MSG_BUF_SIZE]);
-            static mut RX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; POOL_CAPACITY] = [BLOCK; POOL_CAPACITY];
+            static mut RX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; POOL_CAPACITY] =
+                [BLOCK; POOL_CAPACITY];
             #[allow(static_mut_refs)]
-            unsafe { &mut RX_BLOCKS }
+            unsafe {
+                &mut RX_BLOCKS
+            }
         };
         let tx_blocks: &'static mut [ObjectBlock<[u8; MSG_BUF_SIZE]>] = {
             const BLOCK: ObjectBlock<[u8; MSG_BUF_SIZE]> = ObjectBlock::new([0; MSG_BUF_SIZE]);
-            static mut TX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; POOL_CAPACITY] = [BLOCK; POOL_CAPACITY];
+            static mut TX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; POOL_CAPACITY] =
+                [BLOCK; POOL_CAPACITY];
             #[allow(static_mut_refs)]
-            unsafe { &mut TX_BLOCKS }
+            unsafe {
+                &mut TX_BLOCKS
+            }
         };
         for rx_block in rx_blocks {
             RxPool.manage(rx_block);
@@ -87,22 +103,25 @@ where
         }
         // Interface for efficient message management.
         // With uarte, timers and ppi interfaces. A basic pipeline is as follows:
-        //                                                
+        //
         //  STARTRX  -> RXDRDY
         //                 |
         //                  \---> timer.start()
         //                                |                                CHEN[n]
-        //                                 \-----> Compare[m] = CH[n].EEP --------> CH[n].TEP = STOP_RX -> RX_TO -> END_RX  
+        //                                 \-----> Compare[m] = CH[n].EEP --------> CH[n].TEP = STOP_RX -> RX_TO -> END_RX
         //                                             ^                                                     ^
         //                                             |                                                     |
         //                                        cycle_time                                          disable short
-        //                 
+        //
         //  cycle_time = 2^(bitmode + prescaler) / 16_000_000 ~ 16.4 ms. ~8.2 ms works as rxdrdy events happen once every ~6 ms.
         //
         timer.as_timer0().bitmode.write(|w| w.bitmode()._16bit());
         timer.as_timer0().prescaler.write(|w| unsafe { w.bits(2) });
         timer.as_timer0().cc[0].write(|w| unsafe { w.bits(u32::max_value()) });
-        timer.as_timer0().shorts.write(|w| w.compare0_stop().set_bit());
+        timer
+            .as_timer0()
+            .shorts
+            .write(|w| w.compare0_stop().set_bit());
         timer.as_timer0().intenset.write(|w| w.compare0().set());
 
         // Task and event handles.
@@ -155,7 +174,14 @@ where
         uarte.intenset.write(|w| w.error().set());
         uarte.tasks_startrx.write(|w| w.tasks_startrx().set_bit());
 
-        MessageHandler { uarte, timer, ppi1, ppi2, rxp, txp }
+        MessageHandler {
+            uarte,
+            timer,
+            ppi1,
+            ppi2,
+            rxp,
+            txp,
+        }
     }
 
     /// Start sending a message with the given message buffer
@@ -171,7 +197,9 @@ where
             .maxcnt
             .write(|w| unsafe { w.bits(tx_buf.len() as u32) });
         self.uarte.intenset.write(|w| w.endtx().set());
-        self.uarte.tasks_starttx.write(|w| w.tasks_starttx().set_bit());
+        self.uarte
+            .tasks_starttx
+            .write(|w| w.tasks_starttx().set_bit());
     }
 
     // Must be called within the corresponding UARTE perephiral device.
@@ -180,7 +208,9 @@ where
             self.uarte.events_endrx.reset();
             self.uarte.events_rxto.reset();
             self.uarte.shorts.write(|w| w.endrx_startrx().enabled());
-            self.uarte.tasks_flushrx.write(|w| w.tasks_flushrx().set_bit());
+            self.uarte
+                .tasks_flushrx
+                .write(|w| w.tasks_flushrx().set_bit());
         }
         // BEGIN STATE ENDRX
         else if self.uarte.events_endrx.read().events_endrx().bit() {
@@ -204,7 +234,9 @@ where
         // BEGIN STATE ENDTX
         if self.uarte.events_endtx.read().events_endtx().bit() {
             self.uarte.events_endtx.reset();
-            self.uarte.tasks_stoptx.write(|w| w.tasks_stoptx().set_bit());
+            self.uarte
+                .tasks_stoptx
+                .write(|w| w.tasks_stoptx().set_bit());
             let _bytes_transmitted = self.uarte.txd.amount.read().bits();
         }
         // BEGIN STATE ERROR

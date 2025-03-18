@@ -4,15 +4,15 @@
 use panic_halt as _;
 #[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0])]
 mod app {
-    use rtt_target::{rprintln, rtt_init_print};
     use cortex_m::asm;
+    use embedded_rs_lora::mono::{ExtU32, MonoTimer};
     use nrf52840_hal::{
-        gpio::{p0, Disconnected}, 
-        pac::TIMER1, 
-        saadc::SaadcConfig, 
+        gpio::{p0, Disconnected},
+        pac::TIMER1,
+        saadc::SaadcConfig,
         Saadc,
     };
-    use embedded_rs_lora::mono::{ExtU32, MonoTimer};
+    use rtt_target::{rprintln, rtt_init_print};
 
     // Holds all analog pins in use.
     struct SaadcPins {
@@ -36,16 +36,20 @@ mod app {
 
         let mut mono = MonoTimer::new(cx.device.TIMER1);
         let p0 = p0::Parts::new(cx.device.P0);
-        
+
         let saadc = Saadc::new(cx.device.SAADC, SaadcConfig::default());
 
         // Update struct based on desired analog pins here:
-        let saadc_pins = SaadcPins{ pin3: p0.p0_03 };
+        let saadc_pins = SaadcPins { pin3: p0.p0_03 };
 
         // Initiate periodic processes.
         read_analog::spawn(mono.now()).unwrap();
 
-        (Shared {}, Local { saadc, saadc_pins }, init::Monotonics(mono))
+        (
+            Shared {},
+            Local { saadc, saadc_pins },
+            init::Monotonics(mono),
+        )
     }
 
     #[idle]
@@ -57,8 +61,7 @@ mod app {
     }
 
     #[task(local = [saadc, saadc_pins])]
-    fn read_analog(ctx: read_analog::Context, instant: fugit::TimerInstantU32<1_000_000>){
-
+    fn read_analog(ctx: read_analog::Context, instant: fugit::TimerInstantU32<1_000_000>) {
         let pins = ctx.local.saadc_pins;
 
         // Result is collected for 20 µs.

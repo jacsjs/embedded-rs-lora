@@ -1,5 +1,8 @@
-use nrf52840_hal::{timer::{self, Periodic}, Timer};
 use heapless::HistoryBuffer;
+use nrf52840_hal::{
+    timer::{self, Periodic},
+    Timer,
+};
 use rtt_target::rprintln;
 
 const MAX_TRACE_ENTRIES: usize = 16;
@@ -41,21 +44,21 @@ impl core::fmt::Display for TraceState {
 
 pub struct TraceEntry {
     state: TraceState, // Represent the current state (could be an enum as well)
-    debug_var: usize, // Example debug variable
+    debug_var: usize,  // Example debug variable
     timestamp: u32,
 }
 
-pub struct Trace<T> 
-where 
-    T: timer::Instance
+pub struct Trace<T>
+where
+    T: timer::Instance,
 {
     timer: timer::Timer<T, Periodic>,
     entries: HistoryBuffer<TraceEntry, MAX_TRACE_ENTRIES>,
 }
 
-impl<T> Trace<T> 
+impl<T> Trace<T>
 where
-    T: timer::Instance
+    T: timer::Instance,
 {
     pub fn new(mut timer: Timer<T, Periodic>) -> Self {
         timer.start(u32::max_value());
@@ -69,14 +72,13 @@ where
     // in order to avoid branches within ISRs as much as possible.
     #[inline(always)]
     pub fn log(&mut self, state: TraceState, debug_var: usize) {
-
         // Get the timestamp directly at the time of logging
         let timestamp = self.timer.read();
-        
+
         let entry = TraceEntry {
             state,
             debug_var,
-            timestamp
+            timestamp,
         };
         self.entries.write(entry);
     }

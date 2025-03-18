@@ -19,10 +19,11 @@ mod app {
         String,
     };
     use nrf52840_hal::{
-        gpio::{p0, Level, Output, Pin, PushPull}, gpiote::Gpiote, 
-        pac::{TIMER1, TIMER3, TIMER4, UARTE1}, 
-        ppi::{self, ConfigurablePpi, Ppi}, 
-        timer::Timer
+        gpio::{p0, Level, Output, Pin, PushPull},
+        gpiote::Gpiote,
+        pac::{TIMER1, TIMER3, TIMER4, UARTE1},
+        ppi::{self, ConfigurablePpi, Ppi},
+        timer::Timer,
     };
     use rtt_target::{rprintln, rtt_init_print};
 
@@ -82,15 +83,21 @@ mod app {
 
         let rx_blocks: &'static mut [ObjectBlock<[u8; MSG_BUF_SIZE]>] = {
             const BLOCK: ObjectBlock<[u8; MSG_BUF_SIZE]> = ObjectBlock::new([0; MSG_BUF_SIZE]); // <=
-            static mut RX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; POOL_CAPACITY] = [BLOCK; POOL_CAPACITY];
+            static mut RX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; POOL_CAPACITY] =
+                [BLOCK; POOL_CAPACITY];
             #[allow(static_mut_refs)]
-            unsafe { &mut RX_BLOCKS }
+            unsafe {
+                &mut RX_BLOCKS
+            }
         };
         let tx_blocks: &'static mut [ObjectBlock<[u8; MSG_BUF_SIZE]>] = {
             const BLOCK: ObjectBlock<[u8; MSG_BUF_SIZE]> = ObjectBlock::new([0; MSG_BUF_SIZE]); // <=
-            static mut TX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; POOL_CAPACITY] = [BLOCK; POOL_CAPACITY];
+            static mut TX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; POOL_CAPACITY] =
+                [BLOCK; POOL_CAPACITY];
             #[allow(static_mut_refs)]
-            unsafe { &mut TX_BLOCKS }
+            unsafe {
+                &mut TX_BLOCKS
+            }
         };
         for rx_block in rx_blocks {
             RxPool.manage(rx_block);
@@ -118,7 +125,11 @@ mod app {
         let btn1 = p0.p0_11.into_pullup_input().degrade();
 
         // Configure GPIOTE.
-        gpiote.channel0().input_pin(&btn1).hi_to_lo().enable_interrupt();
+        gpiote
+            .channel0()
+            .input_pin(&btn1)
+            .hi_to_lo()
+            .enable_interrupt();
 
         // Task and event handles.
         let event_timer3_compare0_ppi = &uarte_timer.events_compare[0];
@@ -167,9 +178,9 @@ mod app {
 
         blink::spawn().unwrap();
         (
-            Shared { 
-                state, 
-                uarte1, 
+            Shared {
+                state,
+                uarte1,
                 trace,
                 gpiote,
                 lora_params,
@@ -193,8 +204,7 @@ mod app {
     }
 
     #[task(priority=5, local=[], shared=[lora_params])]
-    fn network_handler(_cx: network_handler::Context, _net_pkt_in: Option<Object<RxPool>>) {
-    }
+    fn network_handler(_cx: network_handler::Context, _net_pkt_in: Option<Object<RxPool>>) {}
 
     #[task(priority=6, local=[config], shared=[state, lora_params, trace])]
     fn config(mut cx: config::Context, config_msg: Object<RxPool>) {
@@ -207,7 +217,7 @@ mod app {
                     .expect_raw_string()
                     .finish()
                 {
-                    // Save the address for sending purposes 
+                    // Save the address for sending purposes
                     cx.shared.lora_params.lock(|lr| {
                         lr.device_address = String::try_from(dev_addr).unwrap();
 
@@ -223,14 +233,19 @@ mod app {
                     // Error, could not parse ID response. Maybe try again after a while?
                     trace.log(TraceState::ConfigError, 0);
                     *cx.local.config = Config::ConfigReset;
-                    if let Ok(_) = config::spawn_after(100.millis(), RxPool.request().unwrap()) {()};
+                    if let Ok(_) = config::spawn_after(100.millis(), RxPool.request().unwrap()) {
+                        ()
+                    };
                 }
-            },
+            }
             Config::ConfigTest => {
                 trace.log(TraceState::ConfigTest, 0);
                 let (test_mode, _test_params) = {
-                    let mut segments= config_msg.split_inclusive(|&b| b == b'\n');
-                    (segments.next().unwrap_or_default(), segments.next().unwrap_or_default())
+                    let mut segments = config_msg.split_inclusive(|&b| b == b'\n');
+                    (
+                        segments.next().unwrap_or_default(),
+                        segments.next().unwrap_or_default(),
+                    )
                 };
                 if let Ok((net_mode,)) = CommandParser::parse(test_mode)
                     .expect_identifier(b"+TEST:")
@@ -249,7 +264,7 @@ mod app {
 
                             // I don't know where else to invoke this.
                             display::spawn().unwrap();
-                        },
+                        }
                         _ => {
                             // collect parameters then maybe set in reciever mode?
                             // Only go out of reception while sensor data is ready.
@@ -261,14 +276,16 @@ mod app {
                                 .finish()
                                 .unwrap();
                             start_tx::spawn(msg).ok().unwrap();
-                        },
+                        }
                     }
                 } else {
                     // Error, could not parse test response. Maybe try again after a while?
                     *cx.local.config = Config::ConfigReset;
-                    if let Ok(_) = config::spawn_after(100.millis(), RxPool.request().unwrap()) {()};
+                    if let Ok(_) = config::spawn_after(100.millis(), RxPool.request().unwrap()) {
+                        ()
+                    };
                 }
-            },
+            }
             Config::ConfigSleep => {
                 trace.log(TraceState::ConfigSleep, 0);
                 if let Ok(sleep_status) = CommandParser::parse(config_msg.deref())
@@ -277,20 +294,14 @@ mod app {
                     .finish()
                 {
                     match sleep_status {
-                        ("SLEEP",) => {
-
-                        },
-                        ("WAKEUP",) => {
-
-                        },
-                        _ => {
-
-                        },
+                        ("SLEEP",) => {}
+                        ("WAKEUP",) => {}
+                        _ => {}
                     }
                 } else {
                     // Error, could not parse sleep response. Maybe try again after a while?
                 }
-            },
+            }
             Config::ConfigMode => {
                 trace.log(TraceState::ConfigMode, 0);
                 if let Ok(mode) = CommandParser::parse(config_msg.deref())
@@ -307,8 +318,7 @@ mod app {
                                 .finish()
                                 .unwrap();
                             start_tx::spawn(msg).ok().unwrap();
-
-                        },
+                        }
                         _ => {
                             *cx.local.config = Config::ConfigMode;
                             let mut msg = TxPool.request().unwrap();
@@ -318,16 +328,18 @@ mod app {
                                 .finish()
                                 .unwrap();
                             start_tx::spawn(msg).ok().unwrap();
-                        },
+                        }
                     }
                 } else {
                     // Error, could not parse mode response. Maybe try again after a while?
                     // TODO, for some reason this works instead of ConfigReset, I dont know why yet
                     trace.log(TraceState::ConfigError, 0);
                     *cx.local.config = Config::ConfigAddress;
-                    if let Ok(_) = config::spawn_after(100.millis(), RxPool.request().unwrap()) {()};
+                    if let Ok(_) = config::spawn_after(100.millis(), RxPool.request().unwrap()) {
+                        ()
+                    };
                 }
-            },
+            }
             Config::ConfigReset => {
                 trace.log(TraceState::ConfigReset, 0);
                 let mut reset_msg = TxPool.request().unwrap();
@@ -343,7 +355,7 @@ mod app {
                     .unwrap();
                 *cx.local.config = Config::ConfigAddress;
                 start_tx::spawn(msg).ok().unwrap();
-            },
+            }
         }
     }
 
@@ -380,15 +392,17 @@ mod app {
             let _response = rx_buf.split_at(bytes_to_process).0;
             match state {
                 State::Config(_) => {
-                    if let Ok(_) = config::spawn(rx_buf) { () }
-                },
+                    if let Ok(_) = config::spawn(rx_buf) {
+                        ()
+                    }
+                }
                 State::Run => {
                     // TODO, just a start; probably want more processing before spawning.
-                    if let Ok(_) = network_handler::spawn(Some(rx_buf)) { () }
-                },
-                State::Error => {
-
-                },
+                    if let Ok(_) = network_handler::spawn(Some(rx_buf)) {
+                        ()
+                    }
+                }
+                State::Error => {}
             }
         });
     }
@@ -432,7 +446,9 @@ mod app {
                 if let Ok(_) =
                     process_rx::spawn(top_free_block, bytes_that_require_processing as usize)
                 {
-                    if let Ok(_) = status_led::spawn(StatusLed::RxLed, None){()}
+                    if let Ok(_) = status_led::spawn(StatusLed::RxLed, None) {
+                        ()
+                    }
                 }
             }
             // BEGIN STATE RXSTARTED
@@ -447,7 +463,9 @@ mod app {
                 uarte.tasks_stoptx.write(|w| w.tasks_stoptx().set_bit());
                 let bytes_transmitted = uarte.txd.amount.read().bits();
                 trace.log(TraceState::Endtx, bytes_transmitted as usize);
-                if let Ok(_) = status_led::spawn(StatusLed::TxLed, None){()}
+                if let Ok(_) = status_led::spawn(StatusLed::TxLed, None) {
+                    ()
+                }
             }
             // BEGIN STATE ERROR
             if uarte.events_error.read().events_error().bit() {
@@ -469,13 +487,17 @@ mod app {
         if is_high.unwrap_or(false) {
             sel_led.set_high().ok();
         } else {
-            if let Ok(_) = status_led::spawn_after(fugit::TimerDurationU32::millis(50), led, Some(true)) {()}
+            if let Ok(_) =
+                status_led::spawn_after(fugit::TimerDurationU32::millis(50), led, Some(true))
+            {
+                ()
+            }
             sel_led.set_low().ok();
         }
     }
     /// Lowest priority.
     #[task(priority = 1, local = [blink_led])]
-    fn blink(cx: blink::Context){
+    fn blink(cx: blink::Context) {
         let led = cx.local.blink_led;
         if led.is_set_low().unwrap() {
             led.set_high().ok();
@@ -487,10 +509,12 @@ mod app {
 
     /// Mock "sensor", just to send packages.
     #[task(binds = GPIOTE, local=[], shared = [gpiote, state])]
-    fn gpiote_interrupt(mut cx: gpiote_interrupt::Context){
+    fn gpiote_interrupt(mut cx: gpiote_interrupt::Context) {
         cx.shared.gpiote.lock(|gpiote| {
             if gpiote.channel0().is_event_triggered() {
-                if let Ok(_) = status_led::spawn(StatusLed::RxLed, None){()}
+                if let Ok(_) = status_led::spawn(StatusLed::RxLed, None) {
+                    ()
+                }
                 cx.shared.state.lock(|state| {
                     *state = State::Config(Config::ConfigTest);
                     let mut msg = TxPool.request().unwrap();
