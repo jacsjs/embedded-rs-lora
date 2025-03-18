@@ -3,6 +3,7 @@
 pub mod at_command_handler;
 pub mod util;
 pub mod data_structures;
+pub mod message_handler;
 
 
 #[cfg(test)]

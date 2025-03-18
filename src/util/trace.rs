@@ -2,14 +2,21 @@ use nrf52840_hal::{timer::{self, Periodic}, Timer};
 use heapless::HistoryBuffer;
 use rtt_target::rprintln;
 
-const MAX_TRACE_ENTRIES: usize = 14;
+const MAX_TRACE_ENTRIES: usize = 16;
 
 pub enum TraceState {
     Endrx,
     Endtx,
     RxTo,
     Rxstarted,
-    Rxdrdy
+    Rxdrdy,
+    ConfigAddress,
+    ConfigMode,
+    ConfigReset,
+    ConfigSleep,
+    ConfigTest,
+    ConfigError,
+    Run,
 }
 
 // Implementing the Display trait for the State enum
@@ -21,6 +28,13 @@ impl core::fmt::Display for TraceState {
             TraceState::RxTo => write!(f, "STATE_RXTO     "),
             TraceState::Rxstarted => write!(f, "STATE_RXSTARTED"),
             TraceState::Rxdrdy => write!(f, "STATE_RXDRDY   "),
+            TraceState::ConfigAddress => write!(f, "CONFIG_ADDRESS "),
+            TraceState::ConfigMode => write!(f, "CONFIG_MODE    "),
+            TraceState::ConfigReset => write!(f, "CONFIG_RESET   "),
+            TraceState::ConfigSleep => write!(f, "CONFIG_SLEEP   "),
+            TraceState::ConfigTest => write!(f, "CONFIG_TEST    "),
+            TraceState::ConfigError => write!(f, "CONFIG_ERROR   "),
+            TraceState::Run => write!(f, "STATE_RUN      "),
         }
     }
 }
@@ -77,6 +91,5 @@ where
                 entry.timestamp,
             );
         }
-        //self.timer.task_clear().write(|w| w.tasks_clear().set_bit() );
     }
 }
