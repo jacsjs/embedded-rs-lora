@@ -23,7 +23,8 @@ mod app {
         gpio::{p0, Level, Output, Pin, PushPull},
         pac::{TIMER1, TIMER3, TIMER4, UARTE1},
         ppi::{self, ConfigurablePpi, Ppi},
-        timer::Timer, Uarte,
+        timer::Timer,
+        Uarte,
     };
     use rtt_target::{rprintln, rtt_init_print};
 
@@ -255,7 +256,7 @@ mod app {
         }
     }
 
-    #[task(priority=4, shared=[response_actions],)] 
+    #[task(priority=4, shared=[response_actions],)]
     fn test_uarte(cx: test_uarte::Context) {
         // Simulate TX for now.
         // Later this method will receive commands from other tasks
@@ -300,9 +301,9 @@ mod app {
     /// When a transmission is requested, this function is called with
     /// an already allocated buffer. (See test_uarte as a example)
     #[task(priority=1,capacity=4, local=[tx_queue_producer])]
-    fn tx_ready(cx: tx_ready::Context, rdy_buf: Object<TxPool>, len: usize){
+    fn tx_ready(cx: tx_ready::Context, rdy_buf: Object<TxPool>, len: usize) {
         rprintln!("rdy addr: {:?}", rdy_buf.as_ptr());
-        cx.local.tx_queue_producer.enqueue((rdy_buf,len)).unwrap();
+        cx.local.tx_queue_producer.enqueue((rdy_buf, len)).unwrap();
         if let Ok(_) = start_tx::spawn() {
             ()
         }
@@ -324,10 +325,7 @@ mod app {
                     .txd
                     .ptr
                     .write(|w| unsafe { w.ptr().bits(msg.as_ptr() as u32) });
-                uarte1
-                    .txd
-                    .maxcnt
-                    .write(|w| unsafe { w.bits(*len as u32) });
+                uarte1.txd.maxcnt.write(|w| unsafe { w.bits(*len as u32) });
 
                 // ON(endtx)
                 uarte1.intenset.write(|w| w.endtx().set());
@@ -346,7 +344,7 @@ mod app {
     /// Cleans up completed transmission jobs and
     /// mark as ready for subsequent jobs (if any).
     #[task(priority=4, shared=[uarte1, tx_queue_consumer])]
-    fn finished_tx(cx: finished_tx::Context, bytes_sent: usize){
+    fn finished_tx(cx: finished_tx::Context, bytes_sent: usize) {
         let (drop_buf, len) = cx.shared.tx_queue_consumer.dequeue().unwrap();
         if len == bytes_sent {
             //rprintln!("Ok! len is the same!");
@@ -452,7 +450,7 @@ mod app {
                 uarte.tasks_stoptx.write(|w| w.tasks_stoptx().set_bit());
 
                 // For safety? I don't know how strictly required this is.
-                // Check Product Specification whether this is 
+                // Check Product Specification whether this is
                 // guaranteed in hardware already or not.
                 while uarte.events_txstopped.read().bits() == 0 {}
                 let bytes_transmitted = uarte.txd.amount.read().bits() as usize;

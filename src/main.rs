@@ -1,4 +1,3 @@
-
 #![no_main]
 #![no_std]
 
@@ -15,14 +14,19 @@ mod app {
         trace::{Trace, TraceState},
     };
     use heapless as new_heapless;
+    use hex::ToHex;
     use new_heapless::{
         object_pool,
         pool::object::{Object, ObjectBlock},
         spsc::{Consumer, Producer, Queue},
-        Vec,
+        FnvIndexMap, String, Vec,
     };
     use nrf52840_hal::{
-        gpio::{p0, Level, Output, Pin, PushPull}, gpiote::Gpiote, pac::{TIMER1, TIMER3, TIMER4, UARTE1}, ppi::{self, ConfigurablePpi, Ppi}, timer::Timer
+        gpio::{p0, Level, Output, Pin, PushPull},
+        gpiote::Gpiote,
+        pac::{TIMER1, TIMER3, TIMER4, UARTE1},
+        ppi::{self, ConfigurablePpi, Ppi},
+        timer::Timer,
     };
     use rtt_target::{rprintln, rtt_init_print};
 
@@ -44,6 +48,8 @@ mod app {
         #[lock_free]
         tx_queue_consumer: Consumer<'static, (Object<TxPool>, usize), POOL_CAPACITY>,
         state: State,
+        #[lock_free]
+        test: Test,
         lora_params: LoraParams,
     }
 
@@ -54,7 +60,7 @@ mod app {
         rx_timer: TIMER3,
         tx_queue_producer: Producer<'static, (Object<TxPool>, usize), POOL_CAPACITY>,
         config: Config,
-        test: Test,
+        net_pkt_map: FnvIndexMap<Vec<u8, 11>, usize, 16>,
     }
     pub enum State {
         Config,
@@ -70,7 +76,7 @@ mod app {
     #[derive(Debug, Default)]
     pub struct LoraParams {
         address: Vec<u8, 11>,
-        freq: u32,
+        _freq: u32,
     }
     pub enum Mode {
         ModeTest(Test),
@@ -97,6 +103,7 @@ mod app {
 
         let trace = Trace::new(trace_timer);
         let lora_params = LoraParams::default();
+        let net_pkt_map = FnvIndexMap::default();
         let state = State::Config;
         let config = Config::ConfigAddress;
         let test = Test::TestRx;
@@ -151,7 +158,7 @@ mod app {
         //
         rx_timer.bitmode.write(|w| w.bitmode()._16bit());
         rx_timer.prescaler.write(|w| unsafe { w.bits(2) });
-        rx_timer.cc[0].write(|w| unsafe { w.bits(u32::max_value()) });
+        rx_timer.cc[0].write(|w| unsafe { w.bits(u32::MAX) });
         rx_timer.shorts.write(|w| w.compare0_stop().set_bit());
         rx_timer.intenset.write(|w| w.compare0().set());
 
@@ -240,7 +247,7 @@ mod app {
         uarte1.tasks_startrx.write(|w| w.tasks_startrx().set_bit());
 
         blink::spawn_after(1.secs()).unwrap();
-        display::spawn_after(3.secs(), mono.now()).unwrap();
+        //display::spawn_after(3.secs(), mono.now()).unwrap();
 
         (
             Shared {
@@ -249,6 +256,7 @@ mod app {
                 trace,
                 tx_queue_consumer,
                 state,
+                test,
                 lora_params,
             },
             Local {
@@ -257,7 +265,7 @@ mod app {
                 rx_timer,
                 tx_queue_producer,
                 config,
-                test,
+                net_pkt_map,
             },
             init::Monotonics(mono),
         )
@@ -266,20 +274,19 @@ mod app {
     #[idle]
     fn idle(_cx: idle::Context) -> ! {
         loop {
-            rprintln!("sleeping...");
+            //rprintln!("sleeping...");
             asm::wfi();
         }
     }
 
     #[task(priority=6, shared=[trace])]
-    fn display(cx: display::Context, instant: fugit::TimerInstantU32<1_000_000>) {
-        let next_instant = instant + 3.secs();
-        display::spawn_at(next_instant, next_instant).unwrap();
+    fn display(cx: display::Context) {
         cx.shared.trace.display_trace();
     }
 
-    #[task(local = [config], shared = [state, lora_params])]
+    #[task(priority=5, local = [config], shared = [state, lora_params])]
     fn config(cx: config::Context, config_msg: Object<RxPool>, bytes_sent: usize) {
+        //rprintln!("config_msg: {:?}", config_msg.split_at(bytes_sent).0.utf8_chunks());
         let (command, expected, next_command, on_success): (
             &[u8],
             &[u8],
@@ -298,12 +305,12 @@ mod app {
             ),
             Config::ConfigMode(Mode::ModeLWABP) => (
                 // Not used currently.
-                b"+MODE", 
-                b"+MODE:", 
-                b"+ID", 
+                b"+MODE",
+                b"+MODE:",
+                b"+ID",
                 |next_conf, _, _, _| {
                     *next_conf = Config::ConfigAddress;
-                }
+                },
             ),
             Config::ConfigMode(Mode::ModeTest(_)) => (
                 b"+MODE=TEST",
@@ -314,22 +321,12 @@ mod app {
                     *state_transition = State::Run;
                 },
             ),
-            Config::ConfigReset => (
-                b"+RESET", 
-                b"+RESET: OK", 
-                b"+ID", 
-                |next_conf, _, _, _| {
-                    *next_conf = Config::ConfigAddress;
-                }
-            ),
-            Config::ConfigSleep => (
-                b"+MODE", 
-                b"+MODE:", 
-                b"+ID", 
-                |next_conf, _, _, _| {
-                    *next_conf = Config::ConfigAddress;
-                }
-            ),
+            Config::ConfigReset => (b"+RESET", b"+RESET: OK", b"+ID", |next_conf, _, _, _| {
+                *next_conf = Config::ConfigAddress;
+            }),
+            Config::ConfigSleep => (b"+MODE", b"+MODE:", b"+ID", |next_conf, _, _, _| {
+                *next_conf = Config::ConfigAddress;
+            }),
         };
 
         fn send_command(command: &[u8]) {
@@ -340,7 +337,7 @@ mod app {
                 .unwrap()
                 .len();
             // The LoRa module seem to not be able to handle faster message transactions.
-            tx_ready::spawn_after(100.millis(), tx_buf, command_len).unwrap();
+            start_tx::spawn_after(150.millis(), tx_buf, command_len).unwrap();
         }
 
         // Attempt to parse the incoming message
@@ -360,43 +357,118 @@ mod app {
         }
     }
 
-    #[task(local=[test], shared=[lora_params])]
+    #[task(priority=4, local=[net_pkt_map], shared=[test, lora_params])]
     fn network_handler(mut cx: network_handler::Context, pkt_in: Object<RxPool>, pkt_len: usize) {
-        match cx.local.test {
+        match cx.shared.test {
             Test::TestStop => {
                 rprintln!("TestStop");
             }
             Test::TestRx => {
-                rprintln!("TestRx");
-                rprintln!("pkt_in: {:?}", pkt_in.split_at(pkt_len).0.utf8_chunks());
-                cx.shared.lora_params.lock(|params|{
-                    rprintln!("lora_params: {:?}", params);
-                });
+                if let Ok((pkt_len, pkt_rssi, pkt_snr, pkt_data)) =
+                    CommandParser::parse(pkt_in.split_at(pkt_len).0)
+                        .expect_identifier(b"+TEST: LEN:")
+                        .expect_int_parameter()
+                        .expect_identifier(b"RSSI:")
+                        .expect_int_parameter()
+                        .expect_identifier(b"SNR:")
+                        .expect_int_parameter()
+                        .expect_identifier(b"\r\n+TEST: RX")
+                        .expect_raw_string()
+                        .finish()
+                {
+                    // Packet successfully parsed.
+                    rprintln!("pkt_metadata: {:?}", (pkt_len, pkt_rssi, pkt_snr));
+                    for (index, part) in pkt_data.as_bytes().split(|&b| b == b';').enumerate() {
+                        match index {
+                            0 => {
+                                rprintln!("pkt_addr: {:?}", part.utf8_chunks());
+                                cx.shared.lora_params.lock(|params| {
+                                    rprintln!("lora_addr: {:?}", params.address.utf8_chunks());
+
+                                    // Attempt to create the Vec<u8> from the address
+                                    if let Ok(pkt_addr_vec) = Vec::<u8, 11>::from_slice(part) {
+                                        // Check for packet in hashmap
+                                        if let Some(pkt_cnt) =
+                                            cx.local.net_pkt_map.get_mut(&pkt_addr_vec)
+                                        {
+                                            rprintln!("packet in hashmap: {:?}", pkt_cnt);
+                                            *pkt_cnt += 1;
+                                        } else {
+                                            rprintln!("packet not in hashmap");
+                                            cx.local.net_pkt_map.insert(pkt_addr_vec, 0).unwrap();
+                                        }
+                                    } else {
+                                        rprintln!("Failed to create Vec from address: {:?}", part);
+                                    }
+                                });
+                            }
+                            1 => rprintln!("pkt_cnt: {:?}", part),
+                            2 => rprintln!("pkt_data: {:?}", part),
+                            _ => rprintln!("pkt_other: {:?}", part),
+                        }
+                    }
+                } else {
+                    // Failed to parse LoRa packet.
+                    rprintln!("error parsing network packet");
+                }
             }
             Test::TestTx => {
-                rprintln!("TestTx");
+                if CommandParser::parse(pkt_in.split(|&b| b == b'\n').nth(1).unwrap())
+                    .expect_identifier(b"+TEST: TX DONE")
+                    .finish()
+                    .is_ok()
+                {
+                    rprintln!("tx sent successfully!");
+
+                    *cx.shared.test = Test::TestRx;
+                } else {
+                    rprintln!("tx sent not parsed correctly: {:?}", pkt_in.utf8_chunks());
+                }
             }
         }
     }
-
+    #[task(priority=4, shared=[test, lora_params])]
+    fn send_packet(mut cx: send_packet::Context, pkt_msg: Vec<u8, 32>) {
+        let mut tx_buf = TxPool.request().unwrap();
+        cx.shared.lora_params.lock(|lr| {
+            let pkt_len = CommandBuilder::create_set(tx_buf.deref_mut(), true)
+                .named(b"+TEST")
+                .with_raw_parameter(b"TXLRPKT")
+                .with_string_parameter(pkt_msg.encode_hex_upper::<String<64>>())
+                .finish()
+                .unwrap()
+                .len();
+            *cx.shared.test = Test::TestTx;
+            start_tx::spawn(tx_buf, pkt_len).unwrap();
+        });
+    }
     /// When a transmission is requested, this function is called with
     /// an already allocated buffer. (See test_uarte as a example)
-    #[task(priority=1,capacity=4, local=[tx_queue_producer])]
-    fn tx_ready(cx: tx_ready::Context, rdy_buf: Object<TxPool>, len: usize) {
-        //rprintln!("rdy addr: {:?}", rdy_buf.as_ptr());
-        cx.local.tx_queue_producer.enqueue((rdy_buf, len)).unwrap();
-        if let Ok(_) = start_tx::spawn() {
-            ()
-        }
-    }
+    //#[task(priority=4,capacity=3, local=[])]
+    //fn tx_ready(cx: tx_ready::Context, rdy_buf: Object<TxPool>, len: usize) {
+    //    rprintln!("tx_ready addr: {:?}", rdy_buf.as_ptr());
+    //    cx.local.tx_queue_producer.enqueue((rdy_buf, len)).unwrap();
+    //    rprintln!(
+    //        "tx_ready queue len after enqueue: {:?}",
+    //        cx.local.tx_queue_producer.len()
+    //    );
+    //    if start_tx::spawn(rdy_buf, len).is_ok() {}
+    //}
 
     /// Internal function not to be called explicitly.
     /// This function works through a queue of ready transmission jobs.
-    #[task(priority = 4, shared=[uarte1,tx_queue_consumer], local=[])]
-    fn start_tx(mut cx: start_tx::Context) {
+    #[task(priority = 4, capacity=3, shared=[uarte1], local=[tx_queue_producer])]
+    fn start_tx(mut cx: start_tx::Context, tx_buf: Object<TxPool>, tx_len: usize) {
         cx.shared.uarte1.lock(|uarte1| {
             // Check if there is work to be done...
-            if let Some((msg, len)) = cx.shared.tx_queue_consumer.peek() {
+            rprintln!(
+                "tx_ready queue len before enqueue: {:?}",
+                cx.local.tx_queue_producer.len()
+            );
+            rprintln!("tx_buf enqueue addr: {:?}", tx_buf.as_ptr());
+            rprintln!("tx_buf: {:?}", tx_buf.split_at(tx_len).0.utf8_chunks());
+            if cx.local.tx_queue_producer.ready() {
+                // There was space to enqueue.
                 // Reset the events.
                 uarte1.events_endtx.reset();
                 uarte1.events_txstopped.reset();
@@ -405,17 +477,26 @@ mod app {
                 uarte1
                     .txd
                     .ptr
-                    .write(|w| unsafe { w.ptr().bits(msg.as_ptr() as u32) });
-                uarte1.txd.maxcnt.write(|w| unsafe { w.bits(*len as u32) });
+                    .write(|w| unsafe { w.ptr().bits(tx_buf.as_ptr() as u32) });
+                uarte1
+                    .txd
+                    .maxcnt
+                    .write(|w| unsafe { w.bits(tx_len as u32) });
+
+                cx.local
+                    .tx_queue_producer
+                    .enqueue((tx_buf, tx_len))
+                    .unwrap();
 
                 // ON(endtx)
                 uarte1.intenset.write(|w| w.endtx().set());
 
                 // Start transmission
                 uarte1.tasks_starttx.write(|w| w.tasks_starttx().set_bit());
+                if display::spawn_after(fugit::TimerDurationU32::secs(1)).is_ok() {}
             } else {
-                // Something here to fill upp the buffer again?
-                // Or in a real scenario, try again after awhile?
+                // Queue was full, backfilled with sending messages,
+                rprintln!("error: tx queue is full");
             }
         });
     }
@@ -423,17 +504,23 @@ mod app {
     /// Internal function not to be called explicitly.
     /// Cleans up completed transmission jobs and
     /// mark as ready for subsequent jobs (if any).
+    ///
+    /// TODO BUG: if multiple subsequent transmissions occur finished_tx would only be called once
+    /// instead of the expected number of transmissions amount (most likely due to endtx event only
+    /// triggering when all transmissions are completed; done in nordic hardware).
+    /// Meaning tx_queue unintentionally continues accumilating over time until it's full.
     #[task(priority=4, shared=[uarte1, tx_queue_consumer])]
     fn finished_tx(cx: finished_tx::Context, bytes_sent: usize) {
         let (drop_buf, len) = cx.shared.tx_queue_consumer.dequeue().unwrap();
         if len == bytes_sent {
             //rprintln!("Ok! len is the same!");
         }
-        //rprintln!("drop addr: {:?}", drop_buf.as_ptr());
+        rprintln!("drop addr: {:?}", drop_buf.as_ptr());
+        rprintln!(
+            "tx_ready queue len after dequeue: {:?}",
+            cx.shared.tx_queue_consumer.len()
+        );
         drop((drop_buf, len));
-        if let Ok(_) = start_tx::spawn() {
-            ()
-        }
     }
 
     /// Process the currently completed rx_buffer
@@ -441,16 +528,15 @@ mod app {
     /// This function's content depends on required use-case.
     #[task(priority=5, shared=[state])]
     fn process_rx(mut cx: process_rx::Context, buf: Object<RxPool>, bytes_to_process: usize) {
+        //rprintln!("process_rx: {:?}", buf.split_at(bytes_to_process).0.utf8_chunks());
         cx.shared.state.lock(|state| match state {
             State::Config => {
-                if let Ok(_) = config::spawn(buf, bytes_to_process) {
-                    ()
-                }
+                //rprint!("config_state");
+                if config::spawn(buf, bytes_to_process).is_ok() {}
             }
             State::Run => {
-                if let Ok(_) = network_handler::spawn(buf, bytes_to_process) {
-                    ()
-                }
+                //rprint!("run_state");
+                if network_handler::spawn(buf, bytes_to_process).is_ok() {}
             }
             State::Error => {}
         });
@@ -553,7 +639,7 @@ mod app {
         } else {
             led.set_low().ok();
         }
-        blink::spawn_after(fugit::TimerDurationU32::secs(1)).unwrap();
+        blink::spawn_after(fugit::TimerDurationU32::secs(4)).unwrap();
     }
     /// Lowest priority.
     #[task(priority = 1, capacity = 10, local = [status_led])]
@@ -561,21 +647,20 @@ mod app {
         if is_high.unwrap_or(false) {
             cx.local.status_led.set_high().ok();
         } else {
-            if let Ok(_) =
-                status_led::spawn_after(fugit::TimerDurationU32::millis(50), Some(true))
-            {
-                ()
-            }
+            let _ =
+                status_led::spawn_after(fugit::TimerDurationU32::millis(50), Some(true)).is_ok();
             cx.local.status_led.set_low().ok();
         }
     }
 
     /// Mock "sensor", just to send packages.
-    #[task(binds = GPIOTE, local=[], shared = [gpiote, state])]
+    #[task(priority=7, binds = GPIOTE, local=[], shared = [gpiote, state])]
     fn gpiote_interrupt(mut cx: gpiote_interrupt::Context) {
         cx.shared.gpiote.lock(|gpiote| {
             if gpiote.channel0().is_event_triggered() {
+                gpiote.channel0().event().reset();
                 status_led::spawn(None).unwrap();
+                if send_packet::spawn(Vec::from_slice(b"hello").unwrap()).is_ok() {}
             }
             gpiote.reset_events();
         });

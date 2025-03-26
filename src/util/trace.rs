@@ -5,7 +5,7 @@ use nrf52840_hal::{
 };
 use rtt_target::rprintln;
 
-const MAX_TRACE_ENTRIES: usize = 16;
+const MAX_TRACE_ENTRIES: usize = 8;
 
 pub enum TraceState {
     Endrx,

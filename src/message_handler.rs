@@ -64,7 +64,7 @@ where
     P1: ConfigurablePpi,
     P2: ConfigurablePpi,
 {
-    fn new(
+    fn _new(
         uarte: U,
         timer: T,
         mut ppi1: P1,
@@ -185,7 +185,7 @@ where
     }
 
     /// Start sending a message with the given message buffer
-    fn start_tx(&self, tx_buf: Object<TxPool>) {
+    fn _start_tx(&self, tx_buf: Object<TxPool>) {
         self.uarte.events_endtx.reset();
         self.uarte.events_txstopped.reset();
         self.uarte
@@ -202,8 +202,8 @@ where
             .write(|w| w.tasks_starttx().set_bit());
     }
 
-    // Must be called within the corresponding UARTE perephiral device.
-    fn rx_interrupt(&self) {
+    // Must be called within the corresponding UARTE peripheral device.
+    fn _rx_interrupt(&self) {
         if self.uarte.events_rxto.read().events_rxto().bit() {
             self.uarte.events_endrx.reset();
             self.uarte.events_rxto.reset();
