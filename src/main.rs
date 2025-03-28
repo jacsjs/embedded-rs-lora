@@ -246,7 +246,7 @@ mod app {
         // Start the Uarte receiver.
         uarte1.tasks_startrx.write(|w| w.tasks_startrx().set_bit());
 
-        blink::spawn_after(1.secs()).unwrap();
+        //blink::spawn_after(1.secs()).unwrap();
         //display::spawn_after(3.secs(), mono.now()).unwrap();
 
         (
@@ -274,7 +274,7 @@ mod app {
     #[idle]
     fn idle(_cx: idle::Context) -> ! {
         loop {
-            //rprintln!("sleeping...");
+            rprintln!("sleeping...");
             asm::wfi();
         }
     }
@@ -329,17 +329,6 @@ mod app {
             }),
         };
 
-        fn send_command(command: &[u8]) {
-            let mut tx_buf = TxPool.request().unwrap();
-            let command_len = CommandBuilder::create_execute(tx_buf.deref_mut(), true)
-                .named(command)
-                .finish()
-                .unwrap()
-                .len();
-            // The LoRa module seem to not be able to handle faster message transactions.
-            start_tx::spawn_after(150.millis(), tx_buf, command_len).unwrap();
-        }
-
         // Attempt to parse the incoming message
         if let Ok((param,)) = CommandParser::parse(config_msg.deref())
             .expect_identifier(expected)
@@ -355,6 +344,25 @@ mod app {
             // Not successful in parsing the expected message
             send_command(command);
         }
+    }
+
+    /// Internal function for command creation.
+    /// I know, there is no structure for this small demo.
+    fn send_command(command: &[u8]) {
+        let mut tx_buf = TxPool.request().unwrap();
+        let command_len = CommandBuilder::create_execute(tx_buf.deref_mut(), true)
+            .named(command)
+            .finish()
+            .unwrap()
+            .len();
+        // The LoRa module seem to not be able to handle faster message transactions.
+        if start_tx::spawn_after(120.millis(), tx_buf, command_len).is_ok() {}
+    }
+
+    #[task(priority=4, shared=[test])]
+    fn demo_periodic_rx(cx: demo_periodic_rx::Context) {
+        *cx.shared.test = Test::TestRx;
+        send_command(b"+TEST=RXLRPKT");
     }
 
     #[task(priority=4, local=[net_pkt_map], shared=[test, lora_params])]
@@ -373,40 +381,61 @@ mod app {
                         .expect_identifier(b"SNR:")
                         .expect_int_parameter()
                         .expect_identifier(b"\r\n+TEST: RX")
-                        .expect_raw_string()
+                        .expect_string_parameter()
                         .finish()
                 {
                     // Packet successfully parsed.
-                    rprintln!("pkt_metadata: {:?}", (pkt_len, pkt_rssi, pkt_snr));
-                    for (index, part) in pkt_data.as_bytes().split(|&b| b == b';').enumerate() {
+                    let mut decoded_data: Vec<u8, 64> = Vec::default();
+                    let _ = decoded_data.resize(pkt_len as usize, 0);
+                    hex::decode_to_slice(pkt_data, &mut decoded_data).unwrap();
+
+                    let mut msg_cnt: Option<u8> = None;
+
+                    for (index, part) in decoded_data.split(|&b| b == b';').enumerate() {
                         match index {
                             0 => {
-                                rprintln!("pkt_addr: {:?}", part.utf8_chunks());
                                 cx.shared.lora_params.lock(|params| {
-                                    rprintln!("lora_addr: {:?}", params.address.utf8_chunks());
-
                                     // Attempt to create the Vec<u8> from the address
                                     if let Ok(pkt_addr_vec) = Vec::<u8, 11>::from_slice(part) {
                                         // Check for packet in hashmap
                                         if let Some(pkt_cnt) =
                                             cx.local.net_pkt_map.get_mut(&pkt_addr_vec)
                                         {
-                                            rprintln!("packet in hashmap: {:?}", pkt_cnt);
+                                            rprintln!(
+                                                "packet in hashmap: {:?}",
+                                                &pkt_addr_vec.utf8_chunks()
+                                            );
+                                            // Report locally that another package of the same type has
+                                            // been received.
                                             *pkt_cnt += 1;
                                         } else {
                                             rprintln!("packet not in hashmap");
                                             cx.local.net_pkt_map.insert(pkt_addr_vec, 0).unwrap();
                                         }
                                     } else {
-                                        rprintln!("Failed to create Vec from address: {:?}", part);
+                                        rprintln!(
+                                            "Failed to create Vec from address: {:?}",
+                                            part.utf8_chunks()
+                                        );
                                     }
                                 });
                             }
-                            1 => rprintln!("pkt_cnt: {:?}", part),
-                            2 => rprintln!("pkt_data: {:?}", part),
+                            1 => {
+                                rprintln!("pkt_cnt: {}", part[0]);
+                                msg_cnt = Some(part[0]);
+                            }
+                            2 => rprintln!("pkt_data: {:?}", part.utf8_chunks()),
                             _ => rprintln!("pkt_other: {:?}", part),
                         }
                     }
+
+                    if send_packet::spawn_after(
+                        5.secs(),
+                        Vec::from_slice(b"ack").unwrap(),
+                        msg_cnt.unwrap_or_default(),
+                    )
+                    .is_ok()
+                    {}
                 } else {
                     // Failed to parse LoRa packet.
                     rprintln!("error parsing network packet");
@@ -418,23 +447,34 @@ mod app {
                     .finish()
                     .is_ok()
                 {
-                    rprintln!("tx sent successfully!");
+                    let _ = status_led::spawn(None).is_ok();
 
-                    *cx.shared.test = Test::TestRx;
+                    // Demo a simple power saving feature,
+                    // Here we know a ping has periodicity of 5 secs,
+                    // meaning we warm up the receiver just before.
+                    demo_periodic_rx::spawn_after(4.secs()).unwrap();
+
+                    //*cx.shared.test = Test::TestRx;
+                    //send_command(b"+TEST=RXLRPKT");
                 } else {
                     rprintln!("tx sent not parsed correctly: {:?}", pkt_in.utf8_chunks());
                 }
             }
         }
     }
-    #[task(priority=4, shared=[test, lora_params])]
-    fn send_packet(mut cx: send_packet::Context, pkt_msg: Vec<u8, 32>) {
+    #[task(priority=4, capacity=3, shared=[test, lora_params])]
+    fn send_packet(mut cx: send_packet::Context, pkt_msg: Vec<u8, 32>, pkt_cnt: u8) {
         let mut tx_buf = TxPool.request().unwrap();
         cx.shared.lora_params.lock(|lr| {
+            let mut test_vec: Vec<u8, 64> = Vec::from_slice(&lr.address).unwrap();
+            test_vec.push(b';').ok().unwrap();
+            test_vec.push(pkt_cnt).ok().unwrap();
+            test_vec.push(b';').ok().unwrap();
+            test_vec.extend(pkt_msg);
             let pkt_len = CommandBuilder::create_set(tx_buf.deref_mut(), true)
                 .named(b"+TEST")
                 .with_raw_parameter(b"TXLRPKT")
-                .with_string_parameter(pkt_msg.encode_hex_upper::<String<64>>())
+                .with_string_parameter(test_vec.encode_hex_upper::<String<128>>())
                 .finish()
                 .unwrap()
                 .len();
@@ -529,16 +569,22 @@ mod app {
     #[task(priority=5, shared=[state])]
     fn process_rx(mut cx: process_rx::Context, buf: Object<RxPool>, bytes_to_process: usize) {
         //rprintln!("process_rx: {:?}", buf.split_at(bytes_to_process).0.utf8_chunks());
-        cx.shared.state.lock(|state| match state {
-            State::Config => {
-                //rprint!("config_state");
-                if config::spawn(buf, bytes_to_process).is_ok() {}
+        cx.shared.state.lock(|state| {
+            rprintln!(
+                "rx_buf: {:?}",
+                buf.split_at(bytes_to_process).0.utf8_chunks()
+            );
+            match state {
+                State::Config => {
+                    //rprint!("config_state");
+                    if config::spawn(buf, bytes_to_process).is_ok() {}
+                }
+                State::Run => {
+                    //rprint!("run_state");
+                    if network_handler::spawn(buf, bytes_to_process).is_ok() {}
+                }
+                State::Error => {}
             }
-            State::Run => {
-                //rprint!("run_state");
-                if network_handler::spawn(buf, bytes_to_process).is_ok() {}
-            }
-            State::Error => {}
         });
     }
 
@@ -639,7 +685,7 @@ mod app {
         } else {
             led.set_low().ok();
         }
-        blink::spawn_after(fugit::TimerDurationU32::secs(4)).unwrap();
+        blink::spawn_after(fugit::TimerDurationU32::secs(1)).unwrap();
     }
     /// Lowest priority.
     #[task(priority = 1, capacity = 10, local = [status_led])]
@@ -660,7 +706,7 @@ mod app {
             if gpiote.channel0().is_event_triggered() {
                 gpiote.channel0().event().reset();
                 status_led::spawn(None).unwrap();
-                if send_packet::spawn(Vec::from_slice(b"hello").unwrap()).is_ok() {}
+                if send_packet::spawn(Vec::from_slice(b"hello").unwrap(), 0).is_ok() {}
             }
             gpiote.reset_events();
         });
