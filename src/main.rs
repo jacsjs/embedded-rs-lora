@@ -1,10 +1,12 @@
 #![no_main]
 #![no_std]
-
 use panic_rtt_target as _;
 #[rtic::app(device = nrf52840_hal::pac, dispatchers = [SWI0_EGU0, SWI1_EGU1, SWI2_EGU2, SWI3_EGU3])]
 mod app {
-    use core::ops::{Deref, DerefMut};
+    use core::{
+        cmp::min,
+        ops::{Add, AddAssign, Deref, DerefMut},
+    };
 
     use at_commands::{builder::CommandBuilder, parser::CommandParser};
     use cortex_m::asm;
@@ -14,7 +16,7 @@ mod app {
         trace::{Trace, TraceState},
     };
     use heapless as new_heapless;
-    use hex::ToHex;
+    use hex::{decode_to_slice, ToHex};
     use new_heapless::{
         object_pool,
         pool::object::{Object, ObjectBlock},
@@ -28,13 +30,15 @@ mod app {
         ppi::{self, ConfigurablePpi, Ppi},
         timer::Timer,
     };
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
     use rtt_target::{rprintln, rtt_init_print};
 
     #[monotonic(binds = TIMER1, default = true)]
     type MyMono = MonoTimer<TIMER1>;
 
     const MSG_BUF_SIZE: usize = 256;
-    const POOL_CAPACITY: usize = 5;
+    const RX_POOL_CAPACITY: usize = 3;
+    const TX_POOL_CAPACITY: usize = 6;
 
     object_pool!(RxPool: [u8; MSG_BUF_SIZE]);
     object_pool!(TxPool: [u8; MSG_BUF_SIZE]);
@@ -46,11 +50,13 @@ mod app {
         #[lock_free]
         trace: Trace<TIMER4>,
         #[lock_free]
-        tx_queue_consumer: Consumer<'static, (Object<TxPool>, usize), POOL_CAPACITY>,
+        tx_queue_consumer: Consumer<'static, (Object<TxPool>, usize), TX_POOL_CAPACITY>,
         state: State,
         #[lock_free]
         test: Test,
         lora_params: LoraParams,
+        #[lock_free]
+        rand_num: SmallRng,
     }
 
     #[local]
@@ -58,9 +64,10 @@ mod app {
         blink_led: Pin<Output<PushPull>>,
         status_led: Pin<Output<PushPull>>,
         rx_timer: TIMER3,
-        tx_queue_producer: Producer<'static, (Object<TxPool>, usize), POOL_CAPACITY>,
+        tx_queue_producer: Producer<'static, (Object<TxPool>, usize), TX_POOL_CAPACITY>,
         config: Config,
-        net_pkt_map: FnvIndexMap<Vec<u8, 11>, usize, 16>,
+        net_pkt_map: FnvIndexMap<Vec<u8, 11>, (usize, usize), 16>,
+        last_seq: usize,
     }
     pub enum State {
         Config,
@@ -72,6 +79,7 @@ mod app {
         ConfigMode(Mode),
         ConfigReset,
         ConfigSleep,
+        ConfigBaudRate,
     }
     #[derive(Debug, Default)]
     pub struct LoraParams {
@@ -92,7 +100,7 @@ mod app {
     }
 
     #[init(local = [
-        tx_queue: Queue<(Object<TxPool>,usize), POOL_CAPACITY> = Queue::new(),
+        tx_queue: Queue<(Object<TxPool>,usize), TX_POOL_CAPACITY> = Queue::new(),
     ])]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         rtt_init_print!();
@@ -107,13 +115,15 @@ mod app {
         let state = State::Config;
         let config = Config::ConfigAddress;
         let test = Test::TestRx;
+        let rand_num = SmallRng::seed_from_u64(1);
+        let last_seq = 0;
 
         let (tx_queue_producer, tx_queue_consumer) = cx.local.tx_queue.split();
 
         let rx_blocks: &'static mut [ObjectBlock<[u8; MSG_BUF_SIZE]>] = {
             const BLOCK: ObjectBlock<[u8; MSG_BUF_SIZE]> = ObjectBlock::new([0; MSG_BUF_SIZE]); // <=
-            static mut RX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; POOL_CAPACITY] =
-                [BLOCK; POOL_CAPACITY];
+            static mut RX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; RX_POOL_CAPACITY] =
+                [BLOCK; RX_POOL_CAPACITY];
             #[allow(static_mut_refs)]
             unsafe {
                 &mut RX_BLOCKS
@@ -121,8 +131,8 @@ mod app {
         };
         let tx_blocks: &'static mut [ObjectBlock<[u8; MSG_BUF_SIZE]>] = {
             const BLOCK: ObjectBlock<[u8; MSG_BUF_SIZE]> = ObjectBlock::new([0; MSG_BUF_SIZE]); // <=
-            static mut TX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; POOL_CAPACITY] =
-                [BLOCK; POOL_CAPACITY];
+            static mut TX_BLOCKS: [ObjectBlock<[u8; MSG_BUF_SIZE]>; TX_POOL_CAPACITY] =
+                [BLOCK; TX_POOL_CAPACITY];
             #[allow(static_mut_refs)]
             unsafe {
                 &mut TX_BLOCKS
@@ -156,8 +166,8 @@ mod app {
         //
         //  cycle_time = 2^(bitmode + prescaler) / 16_000_000 ~ 16.4 ms. ~8.2 ms works as rxdrdy events happen once every ~6 ms.
         //
-        rx_timer.bitmode.write(|w| w.bitmode()._16bit());
-        rx_timer.prescaler.write(|w| unsafe { w.bits(2) });
+        rx_timer.bitmode.write(|w| w.bitmode()._08bit());
+        rx_timer.prescaler.write(|w| unsafe { w.bits(8) });
         rx_timer.cc[0].write(|w| unsafe { w.bits(u32::MAX) });
         rx_timer.shorts.write(|w| w.compare0_stop().set_bit());
         rx_timer.intenset.write(|w| w.compare0().set());
@@ -216,7 +226,7 @@ mod app {
             .write(|w| w.parity().excluded().hwfc().disabled());
 
         // Set baud rate
-        uarte1.baudrate.write(|w| w.baudrate().baud9600());
+        uarte1.baudrate.write(|w| w.baudrate().baud230400());
 
         // Set RX and TX pins for uarte1 perhebial.
         uarte1
@@ -246,7 +256,7 @@ mod app {
         // Start the Uarte receiver.
         uarte1.tasks_startrx.write(|w| w.tasks_startrx().set_bit());
 
-        //blink::spawn_after(1.secs()).unwrap();
+        blink::spawn_after(1.secs(), mono.now()).unwrap();
         //display::spawn_after(3.secs(), mono.now()).unwrap();
 
         (
@@ -258,6 +268,7 @@ mod app {
                 state,
                 test,
                 lora_params,
+                rand_num,
             },
             Local {
                 blink_led,
@@ -266,6 +277,7 @@ mod app {
                 tx_queue_producer,
                 config,
                 net_pkt_map,
+                last_seq,
             },
             init::Monotonics(mono),
         )
@@ -274,7 +286,7 @@ mod app {
     #[idle]
     fn idle(_cx: idle::Context) -> ! {
         loop {
-            rprintln!("sleeping...");
+            //rprintln!("sleeping...");
             asm::wfi();
         }
     }
@@ -324,10 +336,24 @@ mod app {
             Config::ConfigReset => (b"+RESET", b"+RESET: OK", b"+ID", |next_conf, _, _, _| {
                 *next_conf = Config::ConfigAddress;
             }),
+            Config::ConfigBaudRate => (b"", b"", b"", |_, _, _, _| {}),
             Config::ConfigSleep => (b"+MODE", b"+MODE:", b"+ID", |next_conf, _, _, _| {
                 *next_conf = Config::ConfigAddress;
             }),
         };
+
+        /// Internal function for command creation.
+        /// I know, there is no structure for this small demo.
+        fn send_command(command: &[u8]) {
+            let mut tx_buf = TxPool.request().unwrap();
+            let command_len = CommandBuilder::create_execute(tx_buf.deref_mut(), true)
+                .named(command)
+                .finish()
+                .unwrap()
+                .len();
+            // The LoRa module seem to not be able to handle faster message transactions.
+            if start_tx::spawn_after(10.millis(), tx_buf, command_len).is_ok() {}
+        }
 
         // Attempt to parse the incoming message
         if let Ok((param,)) = CommandParser::parse(config_msg.deref())
@@ -346,26 +372,22 @@ mod app {
         }
     }
 
-    /// Internal function for command creation.
-    /// I know, there is no structure for this small demo.
-    fn send_command(command: &[u8]) {
-        let mut tx_buf = TxPool.request().unwrap();
-        let command_len = CommandBuilder::create_execute(tx_buf.deref_mut(), true)
-            .named(command)
-            .finish()
-            .unwrap()
-            .len();
-        // The LoRa module seem to not be able to handle faster message transactions.
-        if start_tx::spawn_after(120.millis(), tx_buf, command_len).is_ok() {}
-    }
-
     #[task(priority=4, shared=[test])]
     fn demo_periodic_rx(cx: demo_periodic_rx::Context) {
         *cx.shared.test = Test::TestRx;
-        send_command(b"+TEST=RXLRPKT");
+        //send_command(b"+TEST=RXLRPKT");
     }
 
-    #[task(priority=4, local=[net_pkt_map], shared=[test, lora_params])]
+    // Network as a propegation node:
+    //
+    // Map: [KEY: ID -> VALUE: (seq_id, min_dist)]
+    //
+    //
+    //
+    //
+    //
+
+    #[task(priority=4, local=[net_pkt_map], shared=[test, lora_params, rand_num])]
     fn network_handler(mut cx: network_handler::Context, pkt_in: Object<RxPool>, pkt_len: usize) {
         match cx.shared.test {
             Test::TestStop => {
@@ -384,65 +406,69 @@ mod app {
                         .expect_string_parameter()
                         .finish()
                 {
-                    // Packet successfully parsed.
+                    // Cumbersome way to decode to hex without std.
                     let mut decoded_data: Vec<u8, 64> = Vec::default();
                     let _ = decoded_data.resize(pkt_len as usize, 0);
                     hex::decode_to_slice(pkt_data, &mut decoded_data).unwrap();
 
-                    let mut msg_cnt: Option<u8> = None;
-
-                    for (index, part) in decoded_data.split(|&b| b == b';').enumerate() {
+                    let mut src_addr: Option<Vec<u8, 11>> = None;
+                    let mut seq_num: Option<u8> = None;
+                    let mut hop_num: Option<u8> = None;
+                    let mut pkt_data: Option<&[u8]> = None;
+                    for (index, part) in decoded_data.splitn(4, |&b| b == 0xFF).enumerate() {
                         match index {
-                            0 => {
-                                cx.shared.lora_params.lock(|params| {
-                                    // Attempt to create the Vec<u8> from the address
-                                    if let Ok(pkt_addr_vec) = Vec::<u8, 11>::from_slice(part) {
-                                        // Check for packet in hashmap
-                                        if let Some(pkt_cnt) =
-                                            cx.local.net_pkt_map.get_mut(&pkt_addr_vec)
-                                        {
-                                            rprintln!(
-                                                "packet in hashmap: {:?}",
-                                                &pkt_addr_vec.utf8_chunks()
-                                            );
-                                            // Report locally that another package of the same type has
-                                            // been received.
-                                            *pkt_cnt += 1;
-                                        } else {
-                                            rprintln!("packet not in hashmap");
-                                            cx.local.net_pkt_map.insert(pkt_addr_vec, 0).unwrap();
-                                        }
-                                    } else {
-                                        rprintln!(
-                                            "Failed to create Vec from address: {:?}",
-                                            part.utf8_chunks()
-                                        );
-                                    }
-                                });
-                            }
-                            1 => {
-                                rprintln!("pkt_cnt: {}", part[0]);
-                                msg_cnt = Some(part[0]);
-                            }
-                            2 => rprintln!("pkt_data: {:?}", part.utf8_chunks()),
-                            _ => rprintln!("pkt_other: {:?}", part),
+                            0 => src_addr = Some(Vec::from_slice(part).unwrap_or_default()),
+                            1 => seq_num = part.first().copied(),
+                            2 => hop_num = part.first().copied(),
+                            3 => pkt_data = Some(part),
+                            _ => {}
                         }
                     }
+                    if let Some((map_seq_num, map_hop_num)) =
+                        cx.local.net_pkt_map.get_mut(src_addr.as_ref().unwrap())
+                    {
+                        // Address already registered
+                        // Check if seq_num is higher (newer information)
+                        // If true, update hop_num based on lowest found
+                        // for the received seq_num from the parsed src_addr.
+                        rprintln!("packet already in map: {:?}", (&map_seq_num, &map_hop_num));
+                        if seq_num.unwrap() as usize > *map_seq_num {
+                            *map_seq_num = seq_num.unwrap().into();
+                            *map_hop_num = hop_num.unwrap().min(*map_hop_num as u8).into();
+                        } else if hop_num.unwrap() as usize > *map_hop_num {
+                            rprintln!("Drop packet, because bounce");
+                            return;
+                        }
+                    } else {
+                        // Address not in map yet, add it.
+                        // Here we might check if its a valid address to begin with?
+                        // to avoid cache poisioning in the future.
+                        rprintln!("packet not yet registered: {:?}", (&seq_num, &hop_num));
+                        let _ = cx.local.net_pkt_map.insert(
+                            src_addr.unwrap(),
+                            (seq_num.unwrap().into(), hop_num.unwrap().into()),
+                        );
+                    }
 
+                    // Using random message delay to simulate sporadic sensor signals.
+                    let pkg_delay: u32 = cx.shared.rand_num.random_range(5_000..=10_000);
+                    rprintln!("pkg_delay: {}", pkg_delay);
                     if send_packet::spawn_after(
-                        5.secs(),
+                        pkg_delay.millis(),
                         Vec::from_slice(b"ack").unwrap(),
-                        msg_cnt.unwrap_or_default(),
+                        //msg_cnt.take_if(|c| *c < 10).unwrap_or_default(),
+                        seq_num.unwrap_or_default(),
+                        hop_num.unwrap_or_default().add(1_u8).clamp(0_u8, 254_u8),
                     )
                     .is_ok()
                     {}
                 } else {
                     // Failed to parse LoRa packet.
-                    rprintln!("error parsing network packet");
+                    //rprintln!("error parsing network packet");
                 }
             }
             Test::TestTx => {
-                if CommandParser::parse(pkt_in.split(|&b| b == b'\n').nth(1).unwrap())
+                if CommandParser::parse(pkt_in.deref())
                     .expect_identifier(b"+TEST: TX DONE")
                     .finish()
                     .is_ok()
@@ -450,64 +476,60 @@ mod app {
                     let _ = status_led::spawn(None).is_ok();
 
                     // Demo a simple power saving feature,
-                    // Here we know a ping has periodicity of 5 secs,
+                    // Here we know a ping has periodicity of at least 5 secs,
                     // meaning we warm up the receiver just before.
-                    demo_periodic_rx::spawn_after(4.secs()).unwrap();
-
-                    //*cx.shared.test = Test::TestRx;
-                    //send_command(b"+TEST=RXLRPKT");
+                    //let start_rx_delay: u32 = cx.shared.rand_num.random_range(1..=3);
+                    //if demo_periodic_rx::spawn_after(start_rx_delay.secs()).is_ok() {}
+                    let mut tx_buf = TxPool.request().unwrap();
+                    let command_len = CommandBuilder::create_execute(tx_buf.deref_mut(), true)
+                        .named(b"+TEST=RXLRPKT")
+                        .finish()
+                        .unwrap()
+                        .len();
+                    let _ = start_tx::spawn(tx_buf, command_len).is_ok();
+                    *cx.shared.test = Test::TestRx;
+                    //rprintln!("Set to Rx");
                 } else {
-                    rprintln!("tx sent not parsed correctly: {:?}", pkt_in.utf8_chunks());
+                    // Bug: with multiple random nodes, this execution path
+                    // runs ever so often.
+                    //rprintln!("tx sent not parsed correctly: {:?}", pkt_in.utf8_chunks());
                 }
             }
         }
     }
-    #[task(priority=4, capacity=3, shared=[test, lora_params])]
-    fn send_packet(mut cx: send_packet::Context, pkt_msg: Vec<u8, 32>, pkt_cnt: u8) {
-        let mut tx_buf = TxPool.request().unwrap();
-        cx.shared.lora_params.lock(|lr| {
-            let mut test_vec: Vec<u8, 64> = Vec::from_slice(&lr.address).unwrap();
-            test_vec.push(b';').ok().unwrap();
-            test_vec.push(pkt_cnt).ok().unwrap();
-            test_vec.push(b';').ok().unwrap();
-            test_vec.extend(pkt_msg);
-            let pkt_len = CommandBuilder::create_set(tx_buf.deref_mut(), true)
-                .named(b"+TEST")
-                .with_raw_parameter(b"TXLRPKT")
-                .with_string_parameter(test_vec.encode_hex_upper::<String<128>>())
-                .finish()
-                .unwrap()
-                .len();
-            *cx.shared.test = Test::TestTx;
-            start_tx::spawn(tx_buf, pkt_len).unwrap();
-        });
+    #[task(priority=4, capacity=6, shared=[test, lora_params])]
+    fn send_packet(mut cx: send_packet::Context, pkt_msg: Vec<u8, 32>, seq_num: u8, pkt_cnt: u8) {
+        if let Some(mut tx_buf) = TxPool.request() {
+            cx.shared.lora_params.lock(|lr| {
+                let mut test_vec: Vec<u8, 64> = Vec::from_slice(&lr.address).unwrap();
+                test_vec.push(0xFF).ok().unwrap();
+                test_vec.push(seq_num).ok().unwrap();
+                test_vec.push(0xFF).ok().unwrap();
+                test_vec.push(pkt_cnt).ok().unwrap();
+                test_vec.push(0xFF).ok().unwrap();
+                test_vec.extend(pkt_msg);
+                let pkt_len = CommandBuilder::create_set(tx_buf.deref_mut(), true)
+                    .named(b"+TEST")
+                    .with_raw_parameter(b"TXLRPKT")
+                    .with_string_parameter(test_vec.encode_hex_upper::<String<128>>())
+                    .finish()
+                    .unwrap()
+                    .len();
+                start_tx::spawn(tx_buf, pkt_len).unwrap();
+                //rprintln!("Set to Tx");
+                *cx.shared.test = Test::TestTx;
+            });
+        }
     }
-    /// When a transmission is requested, this function is called with
-    /// an already allocated buffer. (See test_uarte as a example)
-    //#[task(priority=4,capacity=3, local=[])]
-    //fn tx_ready(cx: tx_ready::Context, rdy_buf: Object<TxPool>, len: usize) {
-    //    rprintln!("tx_ready addr: {:?}", rdy_buf.as_ptr());
-    //    cx.local.tx_queue_producer.enqueue((rdy_buf, len)).unwrap();
-    //    rprintln!(
-    //        "tx_ready queue len after enqueue: {:?}",
-    //        cx.local.tx_queue_producer.len()
-    //    );
-    //    if start_tx::spawn(rdy_buf, len).is_ok() {}
-    //}
 
     /// Internal function not to be called explicitly.
     /// This function works through a queue of ready transmission jobs.
-    #[task(priority = 4, capacity=3, shared=[uarte1], local=[tx_queue_producer])]
+    #[task(priority = 4, capacity=6, shared=[uarte1], local=[tx_queue_producer])]
     fn start_tx(mut cx: start_tx::Context, tx_buf: Object<TxPool>, tx_len: usize) {
         cx.shared.uarte1.lock(|uarte1| {
             // Check if there is work to be done...
-            rprintln!(
-                "tx_ready queue len before enqueue: {:?}",
-                cx.local.tx_queue_producer.len()
-            );
-            rprintln!("tx_buf enqueue addr: {:?}", tx_buf.as_ptr());
-            rprintln!("tx_buf: {:?}", tx_buf.split_at(tx_len).0.utf8_chunks());
             if cx.local.tx_queue_producer.ready() {
+                rprintln!("start_tx: {:?}", tx_buf.split_at(tx_len).0.utf8_chunks());
                 // There was space to enqueue.
                 // Reset the events.
                 uarte1.events_endtx.reset();
@@ -533,7 +555,7 @@ mod app {
 
                 // Start transmission
                 uarte1.tasks_starttx.write(|w| w.tasks_starttx().set_bit());
-                if display::spawn_after(fugit::TimerDurationU32::secs(1)).is_ok() {}
+                if display::spawn_after(50.millis()).is_ok() {}
             } else {
                 // Queue was full, backfilled with sending messages,
                 rprintln!("error: tx queue is full");
@@ -549,39 +571,30 @@ mod app {
     /// instead of the expected number of transmissions amount (most likely due to endtx event only
     /// triggering when all transmissions are completed; done in nordic hardware).
     /// Meaning tx_queue unintentionally continues accumilating over time until it's full.
-    #[task(priority=4, shared=[uarte1, tx_queue_consumer])]
-    fn finished_tx(cx: finished_tx::Context, bytes_sent: usize) {
-        let (drop_buf, len) = cx.shared.tx_queue_consumer.dequeue().unwrap();
-        if len == bytes_sent {
-            //rprintln!("Ok! len is the same!");
+    /// Maybe fixed??? Flush entire queue instead because their completion is guaranteed.
+    #[task(priority=5, shared=[uarte1, tx_queue_consumer])]
+    fn finished_tx(mut cx: finished_tx::Context) {
+        while cx.shared.tx_queue_consumer.ready() {
+            let (drop_buf, len) = cx.shared.tx_queue_consumer.dequeue().unwrap();
+            drop((drop_buf, len));
         }
-        rprintln!("drop addr: {:?}", drop_buf.as_ptr());
-        rprintln!(
-            "tx_ready queue len after dequeue: {:?}",
-            cx.shared.tx_queue_consumer.len()
-        );
-        drop((drop_buf, len));
     }
 
     /// Process the currently completed rx_buffer
     /// in the background with lower priority.
     /// This function's content depends on required use-case.
     #[task(priority=5, shared=[state])]
-    fn process_rx(mut cx: process_rx::Context, buf: Object<RxPool>, bytes_to_process: usize) {
-        //rprintln!("process_rx: {:?}", buf.split_at(bytes_to_process).0.utf8_chunks());
+    fn process_rx(mut cx: process_rx::Context, rx_buf: Object<RxPool>, rx_len: usize) {
         cx.shared.state.lock(|state| {
-            rprintln!(
-                "rx_buf: {:?}",
-                buf.split_at(bytes_to_process).0.utf8_chunks()
-            );
+            rprintln!("process_rx: {:?}", rx_buf.split_at(rx_len).0.utf8_chunks());
             match state {
                 State::Config => {
                     //rprint!("config_state");
-                    if config::spawn(buf, bytes_to_process).is_ok() {}
+                    if config::spawn(rx_buf, rx_len).is_ok() {}
                 }
                 State::Run => {
                     //rprint!("run_state");
-                    if network_handler::spawn(buf, bytes_to_process).is_ok() {}
+                    if network_handler::spawn(rx_buf, rx_len).is_ok() {}
                 }
                 State::Error => {}
             }
@@ -665,7 +678,7 @@ mod app {
                 let bytes_transmitted = uarte.txd.amount.read().bits() as usize;
                 trace.log(TraceState::Endtx, bytes_transmitted);
 
-                finished_tx::spawn(bytes_transmitted).ok().unwrap();
+                if finished_tx::spawn().is_ok() {}
             }
             // BEGIN STATE ERROR
             if uarte.events_error.read().events_error().bit() {
@@ -678,14 +691,15 @@ mod app {
 
     /// Lowest priority.
     #[task(priority = 1, local = [blink_led])]
-    fn blink(cx: blink::Context) {
-        let led = cx.local.blink_led;
+    fn blink(ctx: blink::Context, instant: fugit::TimerInstantU32<1_000_000>) {
+        let led = ctx.local.blink_led;
         if led.is_set_low().unwrap() {
             led.set_high().ok();
         } else {
             led.set_low().ok();
         }
-        blink::spawn_after(fugit::TimerDurationU32::secs(1)).unwrap();
+        let next_instant = instant + 1000.millis();
+        blink::spawn_at(next_instant, next_instant).unwrap();
     }
     /// Lowest priority.
     #[task(priority = 1, capacity = 10, local = [status_led])]
@@ -700,13 +714,20 @@ mod app {
     }
 
     /// Mock "sensor", just to send packages.
-    #[task(priority=7, binds = GPIOTE, local=[], shared = [gpiote, state])]
+    #[task(priority=1, binds = GPIOTE, local=[last_seq], shared = [gpiote, state])]
     fn gpiote_interrupt(mut cx: gpiote_interrupt::Context) {
         cx.shared.gpiote.lock(|gpiote| {
             if gpiote.channel0().is_event_triggered() {
                 gpiote.channel0().event().reset();
                 status_led::spawn(None).unwrap();
-                if send_packet::spawn(Vec::from_slice(b"hello").unwrap(), 0).is_ok() {}
+                cx.local.last_seq.add_assign(1);
+                if send_packet::spawn(
+                    Vec::from_slice(b"hello").unwrap(),
+                    *cx.local.last_seq as u8,
+                    0,
+                )
+                .is_ok()
+                {}
             }
             gpiote.reset_events();
         });
